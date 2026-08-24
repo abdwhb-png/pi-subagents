@@ -105,6 +105,7 @@ test("published extension APIs use supported package entrypoints", async () => {
 		".": "./index.ts",
 		"./agents": "./src/api/agents.ts",
 		"./background-work": "./src/api/background-work.ts",
+		"./active-runs": "./src/api/active-runs.ts",
 		"./external-job-provider": "./src/api/external-job-provider.ts",
 		"./external-runs": "./src/api/external-runs.ts",
 		"./capability-ceiling": "./src/api/capability-ceiling.ts",
@@ -119,6 +120,9 @@ test("published extension APIs use supported package entrypoints", async () => {
 	const backgroundWork = await import("pi-subagents/background-work");
 	assert.equal(backgroundWork.BACKGROUND_WORK_PROTOCOL_VERSION, 1);
 	assert.equal(backgroundWork.BACKGROUND_WORK_REGISTRY_KEY, "pi-subagents.background-work.v1");
+	const activeRuns = await import("pi-subagents/active-runs");
+	assert.equal(activeRuns.ACTIVE_SUBAGENT_RUNS_PROTOCOL_VERSION, 1);
+	assert.equal(activeRuns.ACTIVE_SUBAGENT_RUNS_REGISTRY_KEY, "pi-subagents.active-runs.v1");
 	const externalJobProvider = await import("pi-subagents/external-job-provider");
 	assert.equal(externalJobProvider.EXTERNAL_JOB_PROVIDER_PROTOCOL_VERSION, 1);
 	assert.equal(externalJobProvider.EXTERNAL_JOB_PROVIDER_REGISTRY_KEY, "pi-subagents.external-job-providers.v1");

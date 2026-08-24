@@ -8,6 +8,7 @@
   "exports": {
     ".": "./index.ts",
     "./background-work": "./src/api/background-work.ts",
+    "./active-runs": "./src/api/active-runs.ts",
     "./external-job-provider": "./src/api/external-job-provider.ts",
     "./external-runs": "./src/api/external-runs.ts",
     "./agents": "./src/api/agents.ts",

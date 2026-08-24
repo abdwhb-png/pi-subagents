@@ -265,6 +265,19 @@ Semantics:
 
 Child processes do not gain provider tools or extensions automatically. Add `subagent_wait` to the child agent's `tools` allowlist and load each provider through `extensions` or `subagentOnlyExtensions`. The parent's effective `waitTool` setting is serialized through foreground, async, resume, chain, parallel, and fanout launch paths; `PI_SUBAGENT_WAIT_TOOL_ENABLED` keeps precedence.
 
+## Active subagent runs API
+
+Companion extensions can query pi-subagents' own non-terminal jobs without relying on lifecycle-event delivery or reading internal run files:
+
+```ts
+import { snapshotActiveSubagentRuns } from "pi-subagents/active-runs";
+
+const sessionId = ctx.sessionManager.getSessionFile() ?? ctx.sessionManager.getSessionId();
+const runs = snapshotActiveSubagentRuns(sessionId);
+```
+
+The snapshot contains stable `{ id, sessionId }` records for `queued`, `running`, and `paused` jobs owned by the exact Pi session. Sources share `Symbol.for("pi-subagents.active-runs.v1")`, so separately loaded package modules see the same state. pi-subagents registers and disposes its source with the extension runtime. This API is intentionally separate from the background-work provider contract because exposing pi-subagents' own runs there would make `subagent_wait` and headless auto-drain count those runs twice.
+
 ## External job provider bridge
 
 Extensions that own long-running advisor jobs can register a process-local provider for `runner.type: external-job` agents:

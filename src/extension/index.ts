@@ -45,6 +45,7 @@ import { createNativeSupervisorChannel } from "../intercom/native-supervisor-cha
 import { registerHerdrStatusBridge, type HerdrStatusRun } from "../integrations/herdr-status.ts";
 import { listHerdrProjectPaneRoots, restoreHerdrProjectPaneSnapshots } from "../inspectors/herdr/project-panes.ts";
 import { registerSubagentRpcBridge } from "./rpc.ts";
+import { registerSubagentActiveRunsProvider } from "./active-runs-provider.ts";
 import { clearSlashSnapshots, getSlashRenderableSnapshot, resolveSlashMessageDetails, restoreSlashFinalSnapshots, type SlashMessageDetails } from "../slash/slash-live-state.ts";
 import { inspectSubagentStatus } from "../runs/background/run-status.ts";
 import { resolveWaitToolConfig } from "../runs/background/subagent-wait.ts";
@@ -93,6 +94,7 @@ const RUNTIME_REGISTRY_STORE_KEY = "__piSubagentRuntimeRegistry";
 
 interface SubagentRuntimeEntry {
 	cleanup(): void;
+	disposeActiveRunsProvider?: () => void;
 	sessionManager: object | null;
 	visibleControlNotices: Set<string>;
 }
@@ -929,6 +931,8 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 			disposeAsyncJobTracker();
 			for (const timer of state.cleanupTimers.values()) clearTimeout(timer);
 			state.cleanupTimers.clear();
+			runtimeEntry.disposeActiveRunsProvider?.();
+			runtimeEntry.disposeActiveRunsProvider = undefined;
 			state.asyncJobs.clear();
 			for (const unsubscribe of eventUnsubscribes) {
 				try {
@@ -968,6 +972,11 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		}
 		const sessionManager = ctx.sessionManager as object;
 		const previousRuntime = runtimeRegistry.bySessionManager.get(sessionManager);
+		runtimeEntry.disposeActiveRunsProvider?.();
+		runtimeEntry.disposeActiveRunsProvider = registerSubagentActiveRunsProvider(
+			state,
+			resolveCurrentSessionId(ctx.sessionManager),
+		);
 		const existingVisibleControlNotices = runtimeRegistry.visibleControlNoticesBySessionManager.get(sessionManager);
 		if (existingVisibleControlNotices) {
 			visibleControlNotices = existingVisibleControlNotices;
