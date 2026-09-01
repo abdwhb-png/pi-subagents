@@ -19,6 +19,8 @@ const MAX_RAW_LOG_BYTES = 8 * 1024 * 1024;
 const MAX_PARSER_LINE_BYTES = 256 * 1024;
 const MAX_PARSER_STREAM_BYTES = 32 * 1024 * 1024;
 const MAX_PARSER_OUTPUT_BYTES = 1024 * 1024;
+const MAX_OVERSIZED_LINE_PREFIX_BYTES = 512;
+const MAX_SKIPPABLE_LINE_BYTES = 1024 * 1024;
 const PARSER_PROGRESS_INTERVAL_MS = 100;
 
 export function buildExternalCliPrompt(systemInstructions: string, task: string): string {
@@ -39,7 +41,22 @@ export interface ExternalCliParserTerminal {
 
 export interface ExternalCliParser {
 	parseLine(line: string): ExternalCliParserProgress | undefined;
+	/** Inspect only a bounded prefix when a non-terminal event exceeds the normal line cap. */
+	skipOversizedLine?(prefix: string, byteLength: number): ExternalCliParserProgress | undefined;
 	finish(): ExternalCliParserTerminal | undefined;
+}
+
+export function parseExternalCliJsonlEvent(line: string, label: string, maxTypeLength: number): Record<string, unknown> {
+	let value: unknown;
+	try {
+		value = JSON.parse(line) as unknown;
+	} catch (error) {
+		throw new Error(`${label} emitted malformed JSONL: ${error instanceof Error ? error.message : String(error)}`);
+	}
+	if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${label} emitted a JSONL event that is not an object.`);
+	const event = value as Record<string, unknown>;
+	if (typeof event.type !== "string" || !event.type || event.type.length > maxTypeLength) throw new Error(`${label} emitted a JSONL event with an invalid type.`);
+	return event;
 }
 
 export interface ExternalCliRunResult {
@@ -144,6 +161,8 @@ export function runExternalCli(input: {
 	preflight?: ExternalCliPreflightSpec;
 	parser?: ExternalCliParser;
 	finalOutputPath?: string;
+	promptFilePath?: string;
+	temporaryDirectories?: readonly string[];
 	limits?: StreamLimits;
 	registerTimeout?: (stop: (() => void) | undefined) => void;
 	registerStop?: (stop: (() => void) | undefined) => void;
@@ -169,16 +188,34 @@ export function runExternalCli(input: {
 		const stdoutStream = fs.createWriteStream(stdoutPath, { flags: "w" });
 		const stderrStream = fs.createWriteStream(stderrPath, { flags: "w" });
 		const streamsFinished = Promise.allSettled([finished(stdoutStream), finished(stderrStream)]);
+		const createdDirectories: string[] = [];
+		let promptFileCreated = false;
+		const cleanupTemporaryPaths = () => {
+			if (input.promptFilePath && promptFileCreated) fs.rmSync(input.promptFilePath, { force: true });
+			for (const directory of createdDirectories.reverse()) fs.rmSync(directory, { recursive: true, force: true });
+		};
 		const env = externalEnvironment(input.environment?.allowlist, input.environment?.values);
 		let preflight: ExternalCliPreflightResult | undefined;
 		try {
-			if (input.preflight) preflight = preflightExternalCli(input.command, input.preflight, env);
+			for (const directory of input.temporaryDirectories ?? []) {
+				fs.mkdirSync(directory, { mode: 0o700 });
+				createdDirectories.push(directory);
+			}
+			if (input.promptFilePath) {
+				const promptDescriptor = fs.openSync(input.promptFilePath, "wx", 0o600);
+				promptFileCreated = true;
+				try { fs.writeFileSync(promptDescriptor, input.prompt, { encoding: "utf-8" }); }
+				finally { fs.closeSync(promptDescriptor); }
+			}
+			if (input.preflight) preflight = preflightExternalCli(input.command, input.preflight, env, input.cwd);
 		} catch (error) {
 			const endedAt = Date.now();
 			const externalProcess = { startedAt, endedAt, durationMs: endedAt - startedAt, exitCode: 1, processSignal: null, stdoutPath, stderrPath, ...(input.finalOutputPath ? { finalOutputPath: input.finalOutputPath } : {}) } satisfies ExternalProcessStatus;
 			stdoutStream.end();
 			stderrStream.end();
 			void streamsFinished.then((streamResults) => {
+				try { cleanupTemporaryPaths(); }
+				catch (cleanupError) { reject(cleanupError); return; }
 				const streamFailure = streamResults.find((streamResult) => streamResult.status === "rejected");
 				if (streamFailure?.status === "rejected") reject(streamFailure.reason);
 				else resolve({ output: "", exitCode: 1, error: error instanceof Error ? error.message : String(error), processSignal: null, externalProcess });
@@ -191,6 +228,8 @@ export function runExternalCli(input: {
 		const stderrLog = { bytes: 0, total: 0 };
 		let parserBytes = 0;
 		let pendingLine = Buffer.alloc(0);
+		let pendingLineBytes = 0;
+		let pendingLineOversizedAccepted = false;
 		let parserError: Error | undefined;
 		let parserTerminal: ExternalCliParserTerminal | undefined;
 		let latestProgress: ExternalCliParserProgress | undefined;
@@ -231,12 +270,46 @@ export function runExternalCli(input: {
 			if (input.preflight) invalidateExternalCliPreflight(input.command, input.preflight, "parser");
 			if (processTree && processPid !== undefined) termination = terminateExternalProcessTree(processPid, processTree);
 		};
-		const parseLine = (line: Buffer) => {
-			if (!input.parser || parserError) return;
+		const parseLine = (line: Buffer, byteLength = line.length): boolean => {
+			if (!input.parser || parserError) return false;
+			if (byteLength > limits.parserLineBytes) {
+				const progress = input.limits?.parserLineBytes === undefined
+					? input.parser.skipOversizedLine?.(line.subarray(0, MAX_OVERSIZED_LINE_PREFIX_BYTES).toString("utf-8"), byteLength)
+					: undefined;
+				if (progress) { reportProgress(progress); return true; }
+				failParser(new Error("External CLI parser line exceeded its byte limit."));
+				return false;
+			}
 			try {
 				const progress = input.parser.parseLine(line.toString("utf-8"));
 				if (progress) reportProgress(progress);
 			} catch (error) { failParser(error); }
+			return false;
+		};
+		const appendPendingLine = (chunk: Buffer) => {
+			pendingLineBytes += chunk.length;
+			if (pendingLineOversizedAccepted) {
+				if (pendingLineBytes > MAX_SKIPPABLE_LINE_BYTES) failParser(new Error("External CLI parser line exceeded its byte limit."));
+				return;
+			}
+			if (pendingLineBytes <= limits.parserLineBytes) {
+				pendingLine = Buffer.concat([pendingLine, chunk]);
+				return;
+			}
+			if (pendingLineBytes > MAX_SKIPPABLE_LINE_BYTES) {
+				failParser(new Error("External CLI parser line exceeded its byte limit."));
+				return;
+			}
+			if (pendingLine.length > MAX_OVERSIZED_LINE_PREFIX_BYTES) pendingLine = pendingLine.subarray(0, MAX_OVERSIZED_LINE_PREFIX_BYTES);
+			const remainingPrefixBytes = MAX_OVERSIZED_LINE_PREFIX_BYTES - pendingLine.length;
+			if (remainingPrefixBytes > 0) pendingLine = Buffer.concat([pendingLine, chunk.subarray(0, remainingPrefixBytes)]);
+			pendingLineOversizedAccepted = parseLine(pendingLine, pendingLineBytes);
+		};
+		const finishPendingLine = () => {
+			if (!pendingLineOversizedAccepted) parseLine(pendingLine, pendingLineBytes);
+			pendingLine = Buffer.alloc(0);
+			pendingLineBytes = 0;
+			pendingLineOversizedAccepted = false;
 		};
 		const parseChunk = (chunk: Buffer) => {
 			if (!input.parser || parserError) return;
@@ -248,14 +321,11 @@ export function runExternalCli(input: {
 			let start = 0;
 			for (let index = 0; index < chunk.length; index++) {
 				if (chunk[index] !== 0x0a) continue;
-				pendingLine = Buffer.concat([pendingLine, chunk.subarray(start, index)]);
-				if (pendingLine.length > limits.parserLineBytes) return failParser(new Error("External CLI parser line exceeded its byte limit."));
-				parseLine(pendingLine);
-				pendingLine = Buffer.alloc(0);
+				appendPendingLine(chunk.subarray(start, index));
+				finishPendingLine();
 				start = index + 1;
 			}
-			pendingLine = Buffer.concat([pendingLine, chunk.subarray(start)]);
-			if (pendingLine.length > limits.parserLineBytes) failParser(new Error("External CLI parser line exceeded its byte limit."));
+			appendPendingLine(chunk.subarray(start));
 		};
 		const child = spawn(preflight?.binaryPath ?? input.command, input.args ?? [], {
 			cwd: input.cwd,
@@ -291,12 +361,12 @@ export function runExternalCli(input: {
 		input.registerTimeout?.(() => terminate("timeout"));
 		input.registerStop?.(() => terminate("stop"));
 		child.stdin.on("error", () => {});
-		child.stdin.end(input.prompt);
+		child.stdin.end(input.promptFilePath ? undefined : input.prompt);
 		let spawnError: Error | undefined;
 		child.once("error", (error) => { spawnError = error; });
 		child.stdout.once("end", () => {
 			if (!input.parser || parserError) return;
-			if (pendingLine.length > 0) parseLine(pendingLine);
+			if (pendingLineBytes > 0) finishPendingLine();
 			try {
 				parserTerminal = input.parser.finish();
 				if (!parserTerminal) failParser(new Error("External CLI parser did not produce a terminal state."));
@@ -349,6 +419,8 @@ export function runExternalCli(input: {
 				stderrStream.end();
 				const streamResults = await streamsFinished;
 				const streamFailure = streamResults.find((streamResult) => streamResult.status === "rejected");
+				try { cleanupTemporaryPaths(); }
+				catch (cleanupError) { reject(cleanupError); return; }
 				if (streamFailure?.status === "rejected") reject(streamFailure.reason);
 				else resolve(result);
 			})();

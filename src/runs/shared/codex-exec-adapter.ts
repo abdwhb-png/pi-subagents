@@ -1,12 +1,13 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import type { ExternalCliParser, ExternalCliParserProgress, ExternalCliParserTerminal } from "./external-cli-runner.ts";
+import { parseExternalCliJsonlEvent, type ExternalCliParser, type ExternalCliParserProgress, type ExternalCliParserTerminal } from "./external-cli-runner.ts";
 import type { ExternalCliPreflightSpec } from "./external-cli-preflight.ts";
 
 const MAX_FINAL_MESSAGE_BYTES = 1024 * 1024;
 const MAX_EVENT_TYPE_LENGTH = 128;
 
 export const CODEX_EXEC_ADAPTER_ID = "codex-exec" as const;
+export const CODEX_EXEC_WRITER_ADAPTER_ID = "codex-exec-writer" as const;
 export const CODEX_EXEC_ENV_ALLOWLIST = [
 	"PATH",
 	"HOME",
@@ -40,12 +41,7 @@ export function createCodexExecJsonlParser(finalMessagePath: string): ExternalCl
 	let terminal: ExternalCliParserTerminal | undefined;
 	return {
 		parseLine(line): ExternalCliParserProgress {
-			let value: unknown;
-			try { value = JSON.parse(line) as unknown; }
-			catch (error) { throw new Error(`Codex exec emitted malformed JSONL: ${error instanceof Error ? error.message : String(error)}`); }
-			if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Codex exec emitted a JSONL event that is not an object.");
-			const event = value as Record<string, unknown>;
-			if (typeof event.type !== "string" || !event.type || event.type.length > MAX_EVENT_TYPE_LENGTH) throw new Error("Codex exec emitted a JSONL event with an invalid type.");
+			const event = parseExternalCliJsonlEvent(line, "Codex exec", MAX_EVENT_TYPE_LENGTH);
 			if (terminal) throw new Error("Codex exec emitted an event after its terminal state.");
 			eventCount += 1;
 			if (event.type === "turn.completed") terminal = { state: "completed" };
@@ -78,6 +74,7 @@ export function createCodexExecJsonlParser(finalMessagePath: string): ExternalCl
 }
 
 export function resolveCodexExecLaunch(input: {
+	adapter: typeof CODEX_EXEC_ADAPTER_ID | typeof CODEX_EXEC_WRITER_ADAPTER_ID;
 	command: string;
 	asyncDir: string;
 	stepIndex: number;
@@ -87,10 +84,13 @@ export function resolveCodexExecLaunch(input: {
 	command: string;
 	args: string[];
 	finalOutputPath: string;
+	promptFilePath?: undefined;
+	temporaryDirectories?: undefined;
 	environment: { allowlist: readonly string[] };
 	preflight: ExternalCliPreflightSpec;
 	parser: ExternalCliParser;
 } {
+	const writer = input.adapter === CODEX_EXEC_WRITER_ADAPTER_ID;
 	const finalMessagePath = path.join(input.asyncDir, `external-${input.stepIndex}.final-message.txt`);
 	fs.rmSync(finalMessagePath, { force: true });
 	const prefix = [...(input.commandPrefixArgs ?? [])];
@@ -100,9 +100,10 @@ export function resolveCodexExecLaunch(input: {
 		"--json",
 		"--color", "never",
 		"--ephemeral",
+		"--ignore-user-config",
 		"--ignore-rules",
 		"--skip-git-repo-check",
-		"-s", "read-only",
+		"-s", writer ? "workspace-write" : "read-only",
 		"-c", 'approval_policy="never"',
 		"--output-last-message", finalMessagePath,
 		"-",
@@ -113,12 +114,12 @@ export function resolveCodexExecLaunch(input: {
 		finalOutputPath: finalMessagePath,
 		environment: { allowlist: CODEX_EXEC_ENV_ALLOWLIST },
 		preflight: {
-			id: CODEX_EXEC_ADAPTER_ID,
+			id: input.adapter,
 			versionArgs: [...prefix, "--version"],
 			helpArgs: [...prefix, "exec", "--help"],
 			validate(result) {
 				if (!/^codex-cli \d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(result.version)) throw new Error(`Unsupported Codex version response: ${JSON.stringify(result.version)}.`);
-				for (const required of ["Run Codex non-interactively", "--json", "--output-last-message", "--ephemeral", "--ignore-rules", "--skip-git-repo-check", "--sandbox", "read-only", "--config"]) {
+				for (const required of ["Run Codex non-interactively", "--json", "--output-last-message", "--ephemeral", "--ignore-user-config", "--ignore-rules", "--skip-git-repo-check", "--sandbox", writer ? "workspace-write" : "read-only", "--config"]) {
 					if (!result.help.includes(required)) throw new Error(`Codex exec help does not document required option ${JSON.stringify(required)}.`);
 				}
 			},

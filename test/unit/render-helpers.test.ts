@@ -2,8 +2,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { visibleWidth } from "@earendil-works/pi-tui";
-import { row } from "../../src/tui/render-helpers.ts";
-import { renderSubagentResult, truncLine, widgetRenderKey } from "../../src/tui/render.ts";
+import { row, shouldSuppressSingleStep, stripRepeatedAgentPrefix, withDuplicateLabelDiscriminators } from "../../src/tui/render-helpers.ts";
+import { buildWidgetLines, renderSubagentResult, truncLine, widgetRenderKey } from "../../src/tui/render.ts";
 import type { AsyncJobState } from "../../src/shared/types.ts";
 
 const theme = {
@@ -33,9 +33,77 @@ function result(agent: string, output: string) {
 	};
 }
 
+function countedWorkflowJob(onNodesRead: () => void): AsyncJobState {
+	const nodes = [
+		{ id: "step-0", kind: "step", agent: "scout", label: "Scout", status: "completed", flatIndex: 0, stepIndex: 0 },
+		{ id: "step-1", kind: "step", agent: "reviewer", label: "Review", status: "running", flatIndex: 1, stepIndex: 1 },
+	] as const;
+	return {
+		asyncId: "workflow-run",
+		asyncDir: "/tmp/workflow-run",
+		status: "running",
+		mode: "workflow",
+		agents: ["scout", "reviewer"],
+		currentStep: 1,
+		startedAt: 0,
+		updatedAt: 1000,
+		steps: [
+			{ index: 0, agent: "scout", status: "completed", workflowKey: "step-0" },
+			{ index: 1, agent: "reviewer", status: "running", workflowKey: "step-1" },
+		],
+		workflowGraph: {
+			runId: "workflow-run",
+			mode: "workflow",
+			phases: [],
+			currentNodeId: "step-1",
+			get nodes() {
+				onNodesRead();
+				return nodes;
+			},
+		} as never,
+	};
+}
+
 test("row clips content to the available width", () => {
 	const rendered = row("abcdef", 6, theme as any);
 	assert.equal(visibleWidth(rendered), 6);
+});
+
+test("stripRepeatedAgentPrefix removes only safe repeated job-name prefixes", () => {
+	assert.equal(stripRepeatedAgentPrefix("  reviewer: Review the diff  ", "reviewer"), "Review the diff");
+	assert.equal(stripRepeatedAgentPrefix("reviewer · Review the diff", "reviewer"), "Review the diff");
+	assert.equal(stripRepeatedAgentPrefix("reviewer Review the diff", "reviewer"), "Review the diff");
+	assert.equal(stripRepeatedAgentPrefix("reviewer-2: Review the diff", "reviewer"), "reviewer-2: Review the diff");
+	assert.equal(stripRepeatedAgentPrefix("reviewerhood: Review the diff", "reviewer"), "reviewerhood: Review the diff");
+	assert.equal(stripRepeatedAgentPrefix("worker: Review the diff", "reviewer"), "worker: Review the diff");
+	assert.equal(stripRepeatedAgentPrefix("reviewer", "reviewer"), "reviewer");
+});
+
+test("shouldSuppressSingleStep uses logical totals instead of materialized step count", () => {
+	assert.equal(shouldSuppressSingleStep(undefined, 1), true);
+	assert.equal(shouldSuppressSingleStep(1, 1), true);
+	assert.equal(shouldSuppressSingleStep(2, 1), false);
+	assert.equal(shouldSuppressSingleStep(undefined, 2), false);
+	assert.equal(shouldSuppressSingleStep(undefined, undefined), false);
+});
+
+test("withDuplicateLabelDiscriminators preserves unique labels and stable duplicate fractions", () => {
+	const rows = [
+		{ index: 0, displayName: "Gather context" },
+		{ index: 1, displayName: "Review diff" },
+		{ index: 2, displayName: "Review diff" },
+	];
+
+	assert.deepEqual(
+		withDuplicateLabelDiscriminators(rows, 3).map((row) => row.rowLabel),
+		["Gather context", "Agent 2/3: Review diff", "Agent 3/3: Review diff"],
+	);
+
+	const reordered = [rows[2]!, rows[0]!, rows[1]!];
+	assert.deepEqual(
+		withDuplicateLabelDiscriminators(reordered, 3).map((row) => row.rowLabel),
+		["Agent 3/3: Review diff", "Gather context", "Agent 2/3: Review diff"],
+	);
 });
 
 test("row normalizes multiline content before clipping", () => {
@@ -111,6 +179,54 @@ test("widget render keys keep compact payloads quiet and expanded payloads fresh
 	const nestedVisibleChange = structuredClone(job);
 	nestedVisibleChange.nestedChildren = [{ id: "nested-1", parentRunId: "workflow-1", depth: 1, path: [{ runId: "workflow-1" }], state: "failed", agent: "nested", error: "failed" }];
 	assert.notEqual(widgetRenderKey(nestedVisibleChange), widgetRenderKey(job));
+
+	const preflightJob: AsyncJobState = {
+		...job,
+		preflight: { version: 1, coverage: "complete", lanes: [{ key: "writer", decision: "Implement change" }] },
+		workflow: { trace: [], emits: [], console: [], preflightWarnings: ["first mismatch"] },
+	};
+	const warningDetailChange = structuredClone(preflightJob);
+	warningDetailChange.workflow!.preflightWarnings = ["different mismatch"];
+	assert.equal(widgetRenderKey(warningDetailChange), widgetRenderKey(preflightJob));
+	assert.notEqual(widgetRenderKey(warningDetailChange, true), widgetRenderKey(preflightJob, true));
+});
+
+test("seeded running glyphs stay stable until the supplied animation frame advances", () => {
+	const originalNow = Date.now;
+	const runningGlyph = (lines: string[]): string => lines
+		.map((line) => line.match(/[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏●]/u)?.[0])
+		.find((glyph): glyph is string => glyph !== undefined) ?? "";
+	const seededJob: AsyncJobState = {
+		asyncId: "seeded",
+		asyncDir: "/tmp/seeded",
+		status: "running",
+		mode: "single",
+		updatedAt: 1,
+	};
+	const unseededJob: AsyncJobState = {
+		asyncId: "unseeded",
+		asyncDir: "/tmp/unseeded",
+		status: "running",
+		mode: "single",
+	};
+
+	try {
+		Date.now = () => 1_000;
+		const seededFrame0 = runningGlyph(buildWidgetLines([seededJob], theme, 180, false, 0));
+		const unseededBefore = runningGlyph(buildWidgetLines([unseededJob], theme, 180));
+
+		Date.now = () => 1_125;
+		const seededSameFrame = runningGlyph(buildWidgetLines([seededJob], theme, 180, false, 0));
+		const unseededAfter = runningGlyph(buildWidgetLines([unseededJob], theme, 180));
+		const seededNextFrame = runningGlyph(buildWidgetLines([seededJob], theme, 180, false, 1));
+
+		assert.equal(seededSameFrame, seededFrame0);
+		assert.equal(unseededAfter, unseededBefore);
+		assert.equal(unseededBefore, "●");
+		assert.notEqual(seededNextFrame, seededFrame0);
+	} finally {
+		Date.now = originalNow;
+	}
 });
 
 test("multiline rendering omits two-column graphemes at one-column width", () => {
@@ -146,6 +262,8 @@ test("running single-subagent cards show the configured detach shortcut", () => 
 		undefined,
 		"ctrl+b",
 	));
+	assert.match(configured, /task: reviewer task/);
+	assert.match(configured, /Ctrl\+Alt\+F Fleet/);
 	assert.match(configured, /Ctrl\+B to run in background/);
 
 	const unconfigured = componentText(renderSubagentResult(toolResult as never, { expanded: false }, theme as any));
@@ -172,7 +290,34 @@ test("running single-subagent cards show the configured detach shortcut", () => 
 	assert.doesNotMatch(pendingBackground, /run in background/);
 });
 
-test("compact chain rendering uses workflow graph spans for dynamic fanout results", () => {
+test("compact multi-result cards prefer bounded workflow labels over raw tasks", () => {
+	const longLabel = `Review auth flow\n${"x".repeat(140)}`;
+	const running = {
+		...result("reviewer", ""),
+		task: "raw task that should not win",
+		progress: { status: "running", index: 0, agent: "reviewer", toolCount: 0, tokens: 0, durationMs: 0 },
+	};
+	const text = componentText(renderSubagentResult({
+		content: [{ type: "text", text: "running" }],
+		details: {
+			mode: "parallel",
+			results: [running],
+			workflowGraph: {
+				runId: "workflow-task-label",
+				mode: "parallel",
+				phases: [],
+				nodes: [{ id: "review", kind: "agent", agent: "reviewer", label: longLabel, status: "running", flatIndex: 0 }],
+			},
+		},
+	}, { expanded: false }, theme as any));
+
+	assert.match(text, /task: Review auth flow x+/);
+	assert.doesNotMatch(text, /raw task that should not win/);
+	assert.match(text, /\.\.\.$/m);
+	assert.match(text, /Ctrl\+Alt\+F Fleet/);
+});
+
+test("compact chain rendering uses workflow graph labels and parallel groups", () => {
 	const component = renderSubagentResult({
 		content: [{ type: "text", text: "done" }],
 		details: {
@@ -205,10 +350,28 @@ test("compact chain rendering uses workflow graph spans for dynamic fanout resul
 	}, { expanded: false }, theme as any);
 
 	const text = componentText(component);
-	assert.match(text, /Step 1: scout/);
-	assert.match(text, /Agent 1\/2: reviewer/);
-	assert.match(text, /Agent 2\/2: reviewer/);
-	assert.match(text, /Step 3: writer/);
+	assert.match(text, /Step 1\/3: Scout/);
+	assert.match(text, /Step 2\/3: parallel group \(Review targets\)/);
+	assert.match(text, /Review A/);
+	assert.match(text, /Review B/);
+	assert.match(text, /Step 3\/3: Writer/);
+});
+
+test("widget rendering reuses one staged workflow projection", () => {
+	let nodeReads = 0;
+	const lines = buildWidgetLines([countedWorkflowJob(() => nodeReads++)], theme as any, 120, false, 0);
+
+	assert.equal(nodeReads, 1);
+	assert.match(lines.join("\n"), /staged lane · stage 2\/2 · Review · reviewer · running/);
+	assert.match(lines.join("\n"), /Stage 2\/2: Review/);
+});
+
+test("widget render keys reuse one staged workflow projection", () => {
+	let nodeReads = 0;
+
+	widgetRenderKey(countedWorkflowJob(() => nodeReads++));
+
+	assert.equal(nodeReads, 1);
 });
 
 test("compact chain rendering shows failed zero-child dynamic fanout groups", () => {
@@ -244,10 +407,10 @@ test("compact chain rendering shows failed zero-child dynamic fanout groups", ()
 	const text = componentText(component);
 	assert.match(text, /step 1\/3/);
 	assert.doesNotMatch(text, /step 3\/3/);
-	assert.match(text, /Step 1: scout/);
-	assert.match(text, /Step 2: Review targets .* failed/);
+	assert.match(text, /Step 1\/3: Scout/);
+	assert.match(text, /Step 2\/3: parallel group \(Review targets\) · failed/);
 	assert.match(text, /No review targets materialized/);
-	assert.match(text, /Step 3: writer .* pending/);
+	assert.match(text, /Step 3\/3: writer .* pending/);
 });
 
 test("expanded chain rendering uses workflow graph spans for dynamic fanout results", () => {
@@ -283,10 +446,11 @@ test("expanded chain rendering uses workflow graph spans for dynamic fanout resu
 	}, { expanded: true }, theme as any);
 
 	const text = componentText(component);
-	assert.match(text, /Step 1: scout/);
-	assert.match(text, /Agent 1\/2: reviewer/);
-	assert.match(text, /Agent 2\/2: reviewer/);
-	assert.match(text, /Step 3: writer/);
+	assert.match(text, /Step 1\/3: Scout/);
+	assert.match(text, /Step 2\/3: parallel group \(Review targets\)/);
+	assert.match(text, /Review A/);
+	assert.match(text, /Review B/);
+	assert.match(text, /Step 3\/3: Writer/);
 });
 
 test("compact multi-result rendering shows total cost in the header", () => {
@@ -303,7 +467,7 @@ test("compact multi-result rendering shows total cost in the header", () => {
 	assert.match(text, /in:30 out:12 \$0\.0400/);
 });
 
-test("static sequential and static parallel chain rendering keep existing labels", () => {
+test("static sequential and static parallel chain rendering keep logical labels", () => {
 	const sequential = componentText(renderSubagentResult({
 		content: [{ type: "text", text: "done" }],
 		details: {
@@ -313,8 +477,8 @@ test("static sequential and static parallel chain rendering keep existing labels
 			results: [result("scout", "a"), result("writer", "b")],
 		},
 	}, { expanded: false }, theme as any));
-	assert.match(sequential, /Step 1: scout/);
-	assert.match(sequential, /Step 2: writer/);
+	assert.match(sequential, /Step 1\/2: scout task/);
+	assert.match(sequential, /Step 2\/2: writer task/);
 
 	const parallel = componentText(renderSubagentResult({
 		content: [{ type: "text", text: "done" }],
@@ -325,10 +489,26 @@ test("static sequential and static parallel chain rendering keep existing labels
 			results: [result("scout", "a"), result("reviewer", "b"), result("auditor", "c"), result("writer", "d")],
 		},
 	}, { expanded: false }, theme as any));
-	assert.match(parallel, /Step 1: scout/);
-	assert.match(parallel, /Agent 1\/2: reviewer/);
-	assert.match(parallel, /Agent 2\/2: auditor/);
-	assert.match(parallel, /Step 3: writer/);
+	assert.match(parallel, /Step 1\/3: scout task/);
+	assert.match(parallel, /Step 2\/3: parallel group/);
+	assert.match(parallel, /reviewer task/);
+	assert.match(parallel, /auditor task/);
+	assert.match(parallel, /Step 3\/3: writer task/);
+});
+
+test("expanded simple chain summaries strip repeated agent prefixes", () => {
+	const expanded = componentText(renderSubagentResult({
+		content: [{ type: "text", text: "done" }],
+		details: {
+			mode: "chain",
+			chainAgents: ["chain-label"],
+			totalSteps: 1,
+			results: [{ ...result("worker", "done"), sessionName: "  worker: named task  " }],
+		},
+	}, { expanded: true }, theme as any));
+	assert.match(expanded, /named task/);
+	assert.doesNotMatch(expanded, /worker:\s+named task/);
+	assert.doesNotMatch(expanded, /Step 1\/1/);
 });
 
 test("main-window renderer config removes compact result indentation without changing status glyphs", () => {
@@ -342,8 +522,8 @@ test("main-window renderer config removes compact result indentation without cha
 
 	const text = componentText(component);
 	assert.match(text, /^✗ parallel/m);
-	assert.match(text, /^✓ Agent 1\/2: scout/m);
-	assert.match(text, /^✗ Agent 2\/2: reviewer/m);
+	assert.match(text, /^✓ scout task/m);
+	assert.match(text, /^✗ reviewer task/m);
 	assert.match(text, /^⎿  Error: failed/m);
 });
 
