@@ -1,6 +1,6 @@
 import { splitKnownThinkingSuffix, type ModelInfo as AvailableModelInfo } from "../../shared/model-info.ts";
 import type { Usage } from "../../shared/types.ts";
-import { filterFallbackCandidates, parseModelKey, recordModelFailure } from "./model-exclusions.ts";
+import { filterFallbackCandidates, getExclusionsFilePath, isCacheableModelExclusion, parseModelKey, recordModelFailure } from "./model-exclusions.ts";
 import { checkModelScope, type ModelScopeCheckRule, type ModelScopeViolation, type ModelSource } from "./model-scope.ts";
 
 export type { AvailableModelInfo };
@@ -18,10 +18,15 @@ export function splitThinkingSuffix(model: string): { baseModel: string; thinkin
 }
 
 export function formatSubagentModelVerificationError(expectedModel: string, observedModel: string, availableModels: AvailableModelInfo[] | undefined): string | undefined {
-	if (!availableModels || availableModels.length === 0) return undefined;
 	const expectedBase = splitThinkingSuffix(expectedModel).baseModel;
 	const observedBase = splitThinkingSuffix(observedModel).baseModel;
 	if (expectedBase === observedBase) return undefined;
+	if (!availableModels || availableModels.length === 0) {
+		// Without a registry, bare child IDs cannot be mapped back to a provider.
+		// Provider-qualified mismatches are still conclusive and must not fail open.
+		if (!expectedBase.includes("/") || !observedBase.includes("/")) return undefined;
+		return `model_verification_failed: child reported a different model than the launch candidate. Expected '${expectedModel}' but observed '${observedModel}'.`;
+	}
 	const expectedEntry = availableModels.find((entry) => entry.fullId === expectedBase);
 	if (expectedEntry && expectedEntry.id === observedBase) return undefined;
 	return `model_verification_failed: child reported a different model than the launch candidate. Expected '${expectedModel}' but observed '${observedModel}'.`;
@@ -394,7 +399,13 @@ export function buildModelCandidates(
 		seen.add(normalized);
 		candidates.push(normalized);
 	}
-	return filterFallbackCandidates(candidates);
+	const filteredCandidates = filterFallbackCandidates(candidates);
+	if (candidates.length > 0 && filteredCandidates.length === 0) {
+		throw new Error(
+			`All configured subagent models are currently excluded after prior failures: ${candidates.map((candidate) => `'${candidate}'`).join(", ")}. Wait for their exclusions to expire or clear '${getExclusionsFilePath()}' after fixing the underlying problem.`,
+		);
+	}
+	return filteredCandidates;
 }
 
 const RETRYABLE_MODEL_FAILURE_PATTERNS = [
@@ -452,7 +463,7 @@ export function isRetryableModelFailure(error: string | undefined): boolean {
 }
 
 export function recordRetryableModelFailure(model: string | undefined, error: string | undefined): void {
-	if (!model || !isRetryableModelFailure(error)) return;
+	if (!model || !isRetryableModelFailure(error) || !isCacheableModelExclusion(error)) return;
 	const { provider, modelId } = parseModelKey(model);
 	recordModelFailure({ modelId, reason: error, ...(provider ? { provider } : {}) });
 }

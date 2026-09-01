@@ -63,7 +63,7 @@ import { resolveMissionStoreLocation } from "../../src/missions/store.ts";
 import { missionStatePath } from "../../src/missions/workflow-state.ts";
 import { discardPreservedWorktrees } from "../../src/runs/shared/parallel-handoff.ts";
 import { resolveAsyncResumeTarget } from "../../src/runs/background/async-resume.ts";
-import { clearExclusions } from "../../src/runs/shared/model-exclusions.ts";
+import { clearExclusions, recordModelFailure } from "../../src/runs/shared/model-exclusions.ts";
 
 interface ModelAttempt {
 	success?: boolean;
@@ -4660,6 +4660,21 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		const args = readAllCallArgs()[0]!;
 		assert.equal(args[args.indexOf("--model") + 1], "opencode-go/ox-alpha-free:max");
 		assert.equal(mockPi.callCount(), 1);
+	});
+
+	it("fails before spawning Pi when exclusions remove every configured model", async () => {
+		recordModelFailure({ modelId: "ocg/go-minimax-m3", provider: "cpa", reason: "rate limit exceeded" });
+		recordModelFailure({ modelId: "minimax/minimax-m3", provider: "cpa", reason: "rate limit exceeded" });
+		const agents = [makeAgent("worker", {
+			model: "cpa/ocg/go-minimax-m3",
+			fallbackModels: ["cpa/minimax/minimax-m3"],
+		})];
+
+		await assert.rejects(
+			runSync(tempDir, agents, "worker", "Task", { acceptance: false }),
+			/All configured subagent models are currently excluded/,
+		);
+		assert.equal(mockPi.callCount(), 0);
 	});
 
 	it("model override from options takes precedence", async () => {

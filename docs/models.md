@@ -91,6 +91,12 @@ fallbackModels: openai-codex/gpt-5.5:high
 
 One interaction worth knowing for tier 4: forked context over an Anthropic parent transcript with signed thinking blocks forces the child's thinking off, so intent-tier agents work best with fresh context.
 
+## Failure cache
+
+Provider failures temporarily exclude a model for 24 hours in `<temp-root>/model-exclusions.json`, so fallback attempts do not repeatedly retry a rate-limited or unavailable provider. Authentication, credentials, and static catalog errors such as `model not found` are never cached. Existing cached entries with those static errors are removed when the file loads.
+
+If every configured primary and fallback model is excluded, the launch stops before spawning Pi and names the cache file. It never silently omits `--model` and falls back to Pi's default model. After fixing the underlying provider problem, remove that cache file or wait for expiry before retrying.
+
 ## Thinking level defaults
 
 Set `subagents.defaultThinking` to give builtin, package, user, and project agents without a `thinking` value a shared thinking level, independent of the parent session's default. Project settings win over user settings. Explicit frontmatter, `agentOverrides.<name>.thinking`, and per-run thinking overrides still win. `thinking: false` remains an explicit opt-out:

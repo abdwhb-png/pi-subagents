@@ -150,6 +150,26 @@ describe("model exclusions — persistence", () => {
 		});
 	});
 
+	it("drops persisted static model-not-found exclusions", () => {
+		const now = Date.now();
+		fs.writeFileSync(getExclusionsFilePath(), JSON.stringify({
+			version: 1,
+			exclusions: [{
+				modelId: "gpt-4",
+				provider: "openai",
+				reason: "Model 'openai/gpt-4' not found",
+				recordedAt: now,
+				expiresAt: now + 60_000,
+			}],
+		}), "utf-8");
+
+		reloadFromDisk();
+
+		assert.equal(isExcluded("gpt-4", "openai"), false);
+		assert.equal(getExcludedCount(), 0);
+		assert.deepEqual(JSON.parse(fs.readFileSync(getExclusionsFilePath(), "utf-8")).exclusions, []);
+	});
+
 	it("reports corrupt persisted exclusions and starts empty", () => {
 		fs.writeFileSync(getExclusionsFilePath(), "not json", "utf-8");
 		const originalError = console.error;

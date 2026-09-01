@@ -35,6 +35,13 @@ describe("model fallback helpers", () => {
 		);
 	});
 
+	it("fails verification for provider-qualified mismatch without a model registry", () => {
+		assert.match(
+			formatSubagentModelVerificationError("cpa/ocg/go-minimax-m3", "openai-codex/gpt-5.6-sol", []) ?? "",
+			/model_verification_failed/,
+		);
+	});
+
 	it("accepts child-reported bare model ids for the expected registry entry", () => {
 		assert.equal(
 			formatSubagentModelVerificationError("openai/gpt-5-mini:high", "gpt-5-mini", availableModels),
@@ -130,6 +137,25 @@ describe("model fallback helpers", () => {
 		assert.deepEqual(
 			buildModelCandidates("gpt-5-mini", ["anthropic/claude-sonnet-4"], availableModels),
 			["anthropic/claude-sonnet-4"],
+		);
+	});
+
+	it("fails instead of dropping every configured candidate", () => {
+		recordRetryableModelFailure("openai/gpt-5-mini", "rate limit exceeded");
+		recordRetryableModelFailure("anthropic/claude-sonnet-4", "rate limit exceeded");
+
+		assert.throws(
+			() => buildModelCandidates("gpt-5-mini", ["anthropic/claude-sonnet-4"], availableModels),
+			/All configured subagent models are currently excluded/,
+		);
+	});
+
+	it("does not cache a static model-not-found failure", () => {
+		recordRetryableModelFailure("openai/gpt-5-mini", "Model 'openai/gpt-5-mini' not found");
+
+		assert.deepEqual(
+			buildModelCandidates("gpt-5-mini", ["anthropic/claude-sonnet-4"], availableModels),
+			["openai/gpt-5-mini", "anthropic/claude-sonnet-4"],
 		);
 	});
 

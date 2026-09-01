@@ -24,6 +24,27 @@ let defaultTTLMs = 24 * 60 * 60_000; // 24 hours, overridable via setDefaultTTL
 let persistTimer: ReturnType<typeof setTimeout> | null = null;
 let persistSeq = 0;
 
+// These indicate a configuration or credential problem. Retrying another
+// model can still be useful for the current run, but a 24-hour cache would
+// hide an operator fix and can exclude every configured candidate.
+const NON_CACHEABLE_EXCLUSION_REASONS = [
+	/model.*not found/i,
+	/unknown model/i,
+	/invalid model/i,
+	/model.*disabled/i,
+	/auth(?:entication)?/i,
+	/unauthori[sz]ed/i,
+	/forbidden/i,
+	/api key/i,
+	/token expired/i,
+	/invalid key/i,
+];
+
+/** Whether a failure reason may be persisted as a temporary model exclusion. */
+export function isCacheableModelExclusion(reason: string | undefined): boolean {
+	return !reason || !NON_CACHEABLE_EXCLUSION_REASONS.some((pattern) => pattern.test(reason));
+}
+
 /** Override the default exclusion TTL. */
 export function setDefaultTTL(ms: number): void {
 	if (!Number.isFinite(ms) || ms <= 0) throw new Error("Default model exclusion TTL must be a finite positive number.");
@@ -79,8 +100,10 @@ function ensureLoaded(): void {
 		const data = JSON.parse(raw);
 		if (data.version === 1) {
 			const now = Date.now();
-			exclusions = (data.exclusions ?? []).filter((e: ModelExclusion) => e.expiresAt > now);
+			const persisted = data.exclusions ?? [];
+			exclusions = persisted.filter((e: ModelExclusion) => e.expiresAt > now && isCacheableModelExclusion(e.reason));
 			exclusions = deduplicate(exclusions);
+			if (exclusions.length !== persisted.length) flushPersist();
 		}
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
