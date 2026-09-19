@@ -13,6 +13,7 @@ const READ_ONLY_BUILTIN_TOOLS = new Set([
 	"web_search",
 	"fetch_content",
 	"get_search_content",
+	"source_check",
 	"intercom",
 	"contact_supervisor",
 	"structured_output",
@@ -24,7 +25,7 @@ const READ_ONLY_BUILTIN_TOOLS = new Set([
 const CURSOR_FILE_MUTATION_THINKING =
 	/(?:^|\n)\s*Cursor (?:edit|write)\s*:/i;
 
-const REVIVED_TASK_PREFIX = /^You are reviving a previous subagent conversation\.\n\nOriginal run: .+\nOriginal agent: .+(?:\nOriginal session file: .+)?\n\nUse the stored session context as background\. Answer the orchestrator's follow-up below\. Do not assume the original child process is still alive\.\n\nFollow-up:\n/;
+const REVIVED_TASK_PREFIX = /^You are reviving a previous subagent conversation\.\n\nOriginal run: .+\nOriginal agent: .+(?:\nOriginal session file: .+)?\n\nUse the stored session context as background\. Answer the orchestrator's follow-up below\. Do not assume the original child session is still running\.\n\nFollow-up:\n/;
 const IMPLEMENTATION_CHALLENGE_FOLLOW_UP_PATTERN = /^(?:Run )?implementation challenge pass (?:one|two|\d+)(?:\s+and implement any better current[- ]scope change\.?|\s+for the accepted candidate\.\s+Reconsider it and implement any better current[- ]scope change\.?)?$/i;
 const NO_BETTER_CHANGE_NEEDED_PATTERN = /^\s*no (?:better|further|additional) (?:current[- ]scope )?(?:code |source |file )?(?:change|changes|edit|edits|patch|patches) (?:is|are) needed\b/i;
 const KEPT_CURRENT_IMPLEMENTATION_PATTERN = /\b(?:kept (?:the )?current (?:implementation|candidate|shape)|(?:the )?current (?:implementation|candidate|shape) was kept)\b/i;
@@ -97,10 +98,12 @@ export function validateImplementationToolContract(input: {
 	const declaredMutationToolsWereRemoved = requestedMutationTools.length > 0 && !hasBuiltinMutationTool(input.tools);
 	const configuredExtensionCapability = (input.configuredExtensions?.length ?? 0) > 0 && !declaredMutationToolsWereRemoved;
 	if (hasMutationToolCapability(input.tools, input.mcpDirectTools) || configuredExtensionCapability) return undefined;
-	const intent = classifyTaskMutationIntent(input.agent, input.task);
+	const intent = classifyTaskMutationIntent(input.acceptanceRole === "writer" ? "worker" : input.agent, input.task);
 	if (intent.kind === "read-only") return undefined;
-	const writerTaskMayMutate = isWriterRole(input.agent, input.acceptanceRole)
-		&& (taskMayMutate(input.task) || WRITER_DELIVERY_PATTERN.test(input.task));
+	const writerTaskMayMutate = input.acceptanceRole === "writer"
+		? true
+		: isWriterRole(input.agent, input.acceptanceRole)
+			&& (taskMayMutate(input.task) || WRITER_DELIVERY_PATTERN.test(input.task));
 	if (intent.kind !== "implementation" && !writerTaskMayMutate && !declaredMutationToolsWereRemoved) return undefined;
 	return `Agent '${input.agent}' was given an implementation task, but its tool allowlist has no mutation-capable tools. Add bash, edit, write, or another mutation-capable tool to the agent, or use a read-only task/agent.`;
 }

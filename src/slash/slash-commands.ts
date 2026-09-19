@@ -21,17 +21,16 @@ import { formatTokens, shortenPath } from "../shared/formatters.ts";
 import { listAsyncRuns, formatAsyncRunProgressLabel, type AsyncRunSummary } from "../runs/background/async-status.ts";
 import { encodeInspectReply, handleInspectRpcArgs, INSPECT_WIDGET_KEY } from "../runs/background/inspect-rpc.ts";
 import { listScheduledRunSummaries } from "../runs/background/scheduled-runs.ts";
-import { SUBAGENT_FANOUT_CHILD_ENV } from "../runs/shared/pi-args.ts";
 import { resolveAsyncStatusChild } from "../runs/shared/child-identity.ts";
 import { readStatus } from "../shared/utils.ts";
 import { getArtifactPaths, getArtifactsDir } from "../shared/artifacts.ts";
 import { readWorkflowReceipt } from "../workflows/workflow-receipt.ts";
-import { FLEET_OPEN_SHORTCUT } from "../shared/shortcuts.ts";
 import type { SlashSubagentResponse, SlashSubagentUpdate } from "./slash-bridge.ts";
 import { registerPromptWorkflowCommands } from "./prompt-workflows.ts";
 import { openSubagentsAdmin } from "./subagents-admin.ts";
 import { SUBAGENT_GUIDE_TOPICS } from "../extension/subagent-guide.ts";
 import { openSubagentFleet } from "../tui/fleet.ts";
+import { createBuiltinInspectorPlugins } from "../inspectors/plugins.ts";
 import {
 	applySlashUpdate,
 	buildSlashInitialResult,
@@ -861,7 +860,7 @@ export function registerSlashCommands(
 		}
 		fleetOpen = true;
 		try {
-			await openSubagentFleet(ctx, state, { asyncDirRoot: DIRS.async, resultsDir: DIRS.results, fleetKeybindings: options.fleetKeybindings });
+			await openSubagentFleet(ctx, state, { asyncDirRoot: DIRS.async, inspectorPlugins: createBuiltinInspectorPlugins(), resultsDir: DIRS.results, fleetKeybindings: options.fleetKeybindings });
 		} finally {
 			fleetOpen = false;
 		}
@@ -976,11 +975,6 @@ export function registerSlashCommands(
 		handler: async (_args, ctx) => showFleet(ctx),
 	});
 
-	pi.registerShortcut(FLEET_OPEN_SHORTCUT, {
-		description: "Open subagent fleet inspector",
-		handler: async (ctx) => showFleet(ctx),
-	});
-
 	const detachForegroundRun = (args: string, ctx: ExtensionContext): void => {
 		const id = args.trim();
 		let control: ReturnType<typeof selectForegroundDetachControl>;
@@ -1027,11 +1021,6 @@ export function registerSlashCommands(
 			}
 			if (id) {
 				await runCommand(ctx, childId ? { action: "stop", id, childId } : { action: "stop", id });
-				return;
-			}
-
-			if (process.env[SUBAGENT_FANOUT_CHILD_ENV] === "1") {
-				sendSlashText(pi, "Selector unavailable in child-safe fanout mode. Pass an explicit current-session top-level async run id, for example `/subagents-stop <run-id>` or `subagent({ action: \"stop\", id: \"<run-id>\" })`.");
 				return;
 			}
 

@@ -7,6 +7,7 @@ Builtin agents inherit your current Pi default model. This keeps new installs fr
 - `subagents.defaultModel` — a default for every subagent that does not set its own model.
 - `subagents.defaultProvider` — a provider preference for bare model ids, such as `llama-3`, when multiple providers expose the same id.
 - `subagents.agentOverrides.<name>.model` — pin one role.
+- `subagents.agentOverrides.<name>.fallbackModels` — ordered backup models for fresh-session retry.
 - `subagents.agentOverrides.<name>.defaultProvider` — choose or clear the provider preference for one role.
 - `subagents.agentOverridesByProvider.<provider>.<name>` — layer role fields for the active parent provider.
 - Per-run overrides — for one launch only.
@@ -14,6 +15,39 @@ Builtin agents inherit your current Pi default model. This keeps new installs fr
 Precedence, strongest first: per-run override → provider-scoped role override → `agentOverrides.<name>.model` → agent frontmatter `model` → `subagents.defaultModel` → the parent session model. A provider preference does not replace this order; it only resolves bare model ids when the active registry has more than one match. Fully qualified `provider/model` strings still win exactly.
 
 Use `model: "inherit"` in agent frontmatter or `agentOverrides.<name>.model` to select the current parent session model explicitly.
+
+## Fresh-session fallback models (fork compatibility extension)
+
+This fork retains `fallbackModels` without restoring upstream's removed same-session fallback or model-exclusion cache. Configure an ordered list in agent frontmatter:
+
+```yaml
+model: openai/gpt-5-mini
+fallbackModels: anthropic/claude-sonnet-4-5, google/gemini-2.5-pro
+```
+
+Or in settings:
+
+```json
+{
+  "subagents": {
+    "agentOverrides": {
+      "worker": {
+        "model": "openai/gpt-5-mini",
+        "fallbackModels": [
+          "anthropic/claude-sonnet-4-5",
+          "google/gemini-2.5-pro"
+        ]
+      }
+    }
+  }
+}
+```
+
+A native Pi agent launch—direct or inside an ordinary workflow—first runs the resolved primary model. On a provider/model startup failure, pi-subagents starts the next configured model in a **fresh child session**. It never changes models inside a retained child session. Duplicate entries and an entry equal to the primary model are ignored.
+
+Fallback is intentionally narrow. It covers pre-useful-work provider/model/authentication/quota/rate-limit/network/service failures, including empty provider responses. It does not retry after tool activity or non-empty child output, and it does not mask task failures, run-level timeout, interruption, explicit stop, tool/turn budget exhaustion, or structured-output failure. A verified compaction abort after useful progress may still continue the retained child session once on the same resolved model; that lifecycle recovery is separate from model fallback.
+
+Each attempt consumes normal workflow spawn capacity. The outer call keeps its requested foreground/background mode, returns only the successful child's output, and fails if every attempt fails. No model is persistently excluded: every later launch starts from the configured primary model again. Set `fallbackModels: false` in an override to clear inherited fallbacks.
 
 ## Setting defaults and overrides
 
@@ -57,7 +91,7 @@ To keep one role definition but configure it differently for work and personal p
 }
 ```
 
-The provider key comes from the active parent session model (or an explicit host `preferredProvider`) before fallback selection. Provider-scoped fields layer over the ordinary override in the same settings file; project settings still win over user settings. A fallback attempt does not switch the selected provider configuration.
+The provider key comes from the active parent session model (or an explicit host `preferredProvider`). Provider-scoped fields layer over the ordinary override in the same settings file; project settings still win over user settings.
 
 For one run, put the override in the command:
 
@@ -65,7 +99,7 @@ For one run, put the override in the command:
 /run reviewer[model=anthropic/claude-sonnet-4:high] "Review this diff"
 ```
 
-For a persistent role override with a backup model for provider failures:
+For a persistent role override:
 
 ```json
 {
@@ -73,8 +107,7 @@ For a persistent role override with a backup model for provider failures:
     "agentOverrides": {
       "reviewer": {
         "model": "anthropic/claude-sonnet-4",
-        "thinking": "high",
-        "fallbackModels": ["openai-codex/gpt-5.6-luna:low"]
+        "thinking": "high"
       }
     }
   }
@@ -87,7 +120,7 @@ For a persistent role override with a backup model for provider failures:
 
 Set `fast: true` on a run, in agent frontmatter, or in `subagents.agentOverrides.<name>.fast` to request the OpenAI priority service tier for supported native OpenAI-Codex children. This can use a higher quota tier or cost more. It is off by default.
 
-Fast mode fails before launch unless every resolved model candidate is on the allowlist. The current allowlist is `openai-codex/gpt-5.6-luna` and `openai-codex/gpt-5.6-sol`. External runners, Anthropic models, and other providers do not use fast mode.
+Fast mode fails before launch unless the resolved model is on the allowlist. The current allowlist is `openai-codex/gpt-5.6-luna` and `openai-codex/gpt-5.6-sol`. External runners, Anthropic models, and other providers do not use fast mode.
 
 ## Recommended model tiering (optional)
 
@@ -99,26 +132,6 @@ A setup that works well in practice: route agents by task shape instead of runni
 4. **Taste and intent** — a model that reads human intent well and makes judgment calls without looping, for ambiguous work: UX and design decisions, product tradeoffs, planning from vague requirements, writing quality. Example: `anthropic/claude-fable-5` at `low` for lighter passes and `medium` for harder ones.
 
 The routing rule: use the capability tiers (1–3) when the task is well-scoped, and the intent tier (4) when scoping or judging is the task itself.
-
-Give tier-4 agents cross-provider `fallbackModels` so subscription usage limits degrade gracefully instead of failing the run. Fallback triggers on retryable provider/model failures such as rate-limit, overload, unavailable-model, and provider-reported timeout errors. The outer run-level `timeoutMs` / `maxRuntimeMs` deadline is terminal and does not start another fallback attempt:
-
-```yaml
----
-name: shaper
-description: Open-ended design/UX/product/planning agent for ambiguous tasks
-model: anthropic/claude-fable-5
-thinking: medium
-fallbackModels: openai-codex/gpt-5.5:high
----
-```
-
-One interaction worth knowing for tier 4: forked context over an Anthropic parent transcript with signed thinking blocks forces the child's thinking off, so intent-tier agents work best with fresh context.
-
-## Failure cache
-
-Provider failures temporarily exclude a model for 24 hours in `<temp-root>/model-exclusions.json`, so fallback attempts do not repeatedly retry a rate-limited or unavailable provider. Authentication, credentials, and static catalog errors such as `model not found` are never cached. Existing cached entries with those static errors are removed when the file loads.
-
-If every configured primary and fallback model is excluded, the launch stops before spawning Pi and reports that no usable candidate remains. It never silently omits `--model` and falls back to Pi's default model. After fixing the underlying provider problem, remove that cache file or wait for expiry before retrying.
 
 ## Thinking level defaults
 
@@ -150,7 +163,7 @@ Set `subagents.maxThinking` to enforce a hard maximum for every native Pi child.
 }
 ```
 
-Requests above the ceiling fail before child startup; the setting covers frontmatter, `agentOverrides`, per-run overrides, fallback models, parallel/chain children, nested launches, and resumed children. Project settings take precedence over user settings. External runners retain their existing behavior.
+Requests above the ceiling fail before child startup; the setting covers frontmatter, `agentOverrides`, per-run overrides, parallel/chain children, nested launches, and resumed children. Project settings take precedence over user settings. External runners retain their existing behavior.
 
 ## Extension defaults
 
@@ -225,11 +238,11 @@ To keep subagents inside a budget or compliance profile, enforce a model scope. 
 - `agents.<name>` adds a second allow-list for that agent. The model must pass both the global list and the matching agent list, so an agent rule cannot weaken the global rule. Agent rules inherit `enforce` and `strict` when those fields are absent.
 - A top-level `enforce: true` with only agent allow-lists restricts only those named agents. Unknown names are allowed so settings can be shared across projects and machines.
 - Models you pass explicitly — the tool-call `model`, `--model`, or a clarify pick — error and abort the run.
-- By default, models from agent frontmatter, `subagents.defaultModel`, the inherited parent session model, or fallback chains only warn and remain available, so existing configurations keep working while you tighten the scope.
-- Set `strict: true` with `enforce: true` to reject every resolved out-of-scope model. This includes inherited models and fallback candidates. An invalid fallback fails the run instead of being removed from the candidate chain.
+- By default, models from agent frontmatter, `subagents.defaultModel`, or the inherited parent session model only warn and remain available, so existing configurations keep working while you tighten the scope.
+- Set `strict: true` with `enforce: true` to reject every resolved out-of-scope model, including inherited models.
 - `enforce: true` requires at least one non-empty global or agent `allow` list; otherwise the config is rejected at load time.
 
-Model scope is policy only. It rejects or warns; it does not select a cheaper model. Set `agentOverrides.worker.model` to choose a worker model and use `modelScope.agents.worker` to prevent a per-run override or fallback from escaping that restriction.
+Model scope is policy only. It rejects or warns; it does not select a cheaper model. Set `agentOverrides.worker.model` to choose a worker model and use `modelScope.agents.worker` to prevent a per-run override from escaping that restriction.
 
 `inherit` expands in the parent process at each launch. It is never sent to the child as a model id. A nested child therefore inherits its immediate parent's current model, not the original top-level model. If no parent model is available, an enforced `inherit` entry does not match and fails closed.
 

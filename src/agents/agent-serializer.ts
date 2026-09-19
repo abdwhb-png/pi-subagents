@@ -6,6 +6,7 @@ export const KNOWN_FIELDS = new Set([
 	"name",
 	"package",
 	"description",
+	"advertise",
 	"alias",
 	"aliases",
 	"tools",
@@ -31,8 +32,10 @@ export const KNOWN_FIELDS = new Set([
 	"extensions",
 	"subagentOnlyExtensions",
 	"mutationTools",
+	"machine",
 	"output",
 	"outputMode",
+	"outputSchema",
 	"defaultReads",
 	"defaultProgress",
 	"interactive",
@@ -62,6 +65,7 @@ export function serializeAgent(config: AgentConfig, options: SerializeAgentOptio
 	lines.push(`name: ${frontmatterNameForConfig(config)}`);
 	if (config.packageName) lines.push(`package: ${config.packageName}`);
 	lines.push(`description: ${config.description}`);
+	if (config.advertise === true || preserve("advertise")) lines.push(`advertise: ${config.advertise === true ? "true" : "false"}`);
 	const aliasesValue = joinComma(config.aliases);
 	if (aliasesValue || preserve("alias", "aliases")) lines.push(`aliases: ${aliasesValue ?? ""}`);
 
@@ -125,8 +129,10 @@ export function serializeAgent(config: AgentConfig, options: SerializeAgentOptio
 	const mutationToolsValue = joinComma(config.mutationTools);
 	if (mutationToolsValue || preserve("mutationTools")) lines.push(`mutationTools: ${mutationToolsValue ?? ""}`);
 
+	if (config.machine || preserve("machine")) lines.push(`machine: ${config.machine ?? ""}`);
 	if (config.output || preserve("output")) lines.push(`output: ${config.output ?? ""}`);
 	if (config.outputMode || preserve("outputMode")) lines.push(`outputMode: ${config.outputMode ?? ""}`);
+	if (config.outputSchema || preserve("outputSchema")) lines.push(`outputSchema: ${config.outputSchema ? JSON.stringify(config.outputSchema) : ""}`);
 
 	const readsValue = joinComma(config.defaultReads);
 	if (readsValue || preserve("defaultReads")) lines.push(`defaultReads: ${readsValue ?? ""}`);

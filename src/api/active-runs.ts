@@ -7,9 +7,13 @@ const MAX_RUNS_PER_SOURCE = 10_000;
 const MAX_ID_LENGTH = 256;
 const MAX_SESSION_ID_LENGTH = 256;
 
+export type ActiveSubagentRunStatus = "queued" | "running" | "paused";
+
 export interface ActiveSubagentRun {
   id: string;
   sessionId: string;
+  /** Optional for backward-compatible process-global sources. */
+  status?: ActiveSubagentRunStatus;
 }
 
 export interface ActiveSubagentRunSource {
@@ -84,11 +88,22 @@ function validateRun(value: unknown, index: number): ActiveSubagentRun {
     throw new Error(`Active subagent run ${index} must be an object.`);
   }
   const run = value as Record<string, unknown>;
-  const unknownFields = Object.keys(run).filter((key) => key !== "id" && key !== "sessionId");
+  const unknownFields = Object.keys(run).filter(
+    (key) => key !== "id" && key !== "sessionId" && key !== "status",
+  );
   if (unknownFields.length > 0) {
     throw new Error(
       `Active subagent run ${index} has unknown fields: ${unknownFields.join(", ")}.`,
     );
+  }
+  const status = run.status;
+  if (
+    status !== undefined &&
+    status !== "queued" &&
+    status !== "running" &&
+    status !== "paused"
+  ) {
+    throw new Error(`Active subagent run ${index} has an invalid status.`);
   }
   return {
     id: validateString(run.id, `Active subagent run ${index} id`, MAX_ID_LENGTH),
@@ -97,6 +112,7 @@ function validateRun(value: unknown, index: number): ActiveSubagentRun {
       `Active subagent run ${index} sessionId`,
       MAX_SESSION_ID_LENGTH,
     ),
+    ...(status === undefined ? {} : { status }),
   };
 }
 

@@ -2,19 +2,18 @@ import { execFileSync } from "node:child_process";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, it } from "node:test";
-import { SUBAGENT_CHILD_ENV, SUBAGENT_FANOUT_CHILD_ENV } from "../../src/runs/shared/pi-args.ts";
+import { SUBAGENT_CHILD_ENV } from "../../src/runs/shared/child-runtime-config.ts";
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 
 function parentEnv(): NodeJS.ProcessEnv {
   const env = { ...process.env };
   delete env[SUBAGENT_CHILD_ENV];
-  delete env[SUBAGENT_FANOUT_CHILD_ENV];
   return env;
 }
 
 describe("subagent extension active-runs bridge", () => {
-  it("publishes lifecycle-tracked jobs and disposes the source on shutdown", () => {
+  it("keeps the rollback bridge dormant during extension lifecycle", () => {
     const script = String.raw`
 			import registerSubagentExtension from "./index.ts";
 			import { snapshotActiveSubagentRuns } from "./src/api/active-runs.ts";
@@ -33,7 +32,11 @@ describe("subagent extension active-runs bridge", () => {
 			};
 			const fakePi = new Proxy({
 				events,
-				on(name, handler) { handlers.set(name, handler); },
+				on(name, handler) {
+					const listeners = handlers.get(name) ?? [];
+					listeners.push(handler);
+					handlers.set(name, listeners);
+				},
 				registerTool() {}, registerCommand() {}, registerShortcut() {}, registerMessageRenderer() {},
 				sendMessage() {}, sendUserMessage() {}, getSessionName() { return undefined; },
 			}, { get(target, prop) { return prop in target ? target[prop] : () => undefined; } });
@@ -48,14 +51,14 @@ describe("subagent extension active-runs bridge", () => {
 				},
 				modelRegistry: { getAvailable() { return []; } },
 			};
-			await handlers.get("session_start")({ reason: "startup" }, ctx);
+			for (const handler of handlers.get("session_start") ?? []) await handler({ reason: "startup" }, ctx);
 			events.emit("subagent:async-started", {
 				id: "run-active", pid: 1, sessionId: "/sessions/session-active.jsonl",
 				mode: "single", agent: "worker", asyncDir: "/tmp/run-active",
 			});
 			const active = snapshotActiveSubagentRuns("/sessions/session-active.jsonl");
-			if (active.length !== 1 || active[0].id !== "run-active") throw new Error("active run was not published: " + JSON.stringify(active));
-			await handlers.get("session_shutdown")({ reason: "shutdown" }, ctx);
+			if (active.length !== 0) throw new Error("dormant bridge published active runs: " + JSON.stringify(active));
+			for (const handler of handlers.get("session_shutdown") ?? []) await handler({ reason: "shutdown" }, ctx);
 			const afterShutdown = snapshotActiveSubagentRuns("/sessions/session-active.jsonl");
 			if (afterShutdown.length !== 0) throw new Error("shutdown left active runs published: " + JSON.stringify(afterShutdown));
 		`;

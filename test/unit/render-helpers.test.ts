@@ -33,37 +33,6 @@ function result(agent: string, output: string) {
 	};
 }
 
-function countedWorkflowJob(onNodesRead: () => void): AsyncJobState {
-	const nodes = [
-		{ id: "step-0", kind: "step", agent: "scout", label: "Scout", status: "completed", flatIndex: 0, stepIndex: 0 },
-		{ id: "step-1", kind: "step", agent: "reviewer", label: "Review", status: "running", flatIndex: 1, stepIndex: 1 },
-	] as const;
-	return {
-		asyncId: "workflow-run",
-		asyncDir: "/tmp/workflow-run",
-		status: "running",
-		mode: "workflow",
-		agents: ["scout", "reviewer"],
-		currentStep: 1,
-		startedAt: 0,
-		updatedAt: 1000,
-		steps: [
-			{ index: 0, agent: "scout", status: "completed", workflowKey: "step-0" },
-			{ index: 1, agent: "reviewer", status: "running", workflowKey: "step-1" },
-		],
-		workflowGraph: {
-			runId: "workflow-run",
-			mode: "workflow",
-			phases: [],
-			currentNodeId: "step-1",
-			get nodes() {
-				onNodesRead();
-				return nodes;
-			},
-		} as never,
-	};
-}
-
 test("row clips content to the available width", () => {
 	const rendered = row("abcdef", 6, theme as any);
 	assert.equal(visibleWidth(rendered), 6);
@@ -263,7 +232,7 @@ test("running single-subagent cards show the configured detach shortcut", () => 
 		"ctrl+b",
 	));
 	assert.match(configured, /task: reviewer task/);
-	assert.match(configured, /Ctrl\+Alt\+F Fleet/);
+	assert.doesNotMatch(configured, /Fleet/);
 	assert.match(configured, /Ctrl\+B to run in background/);
 
 	const unconfigured = componentText(renderSubagentResult(toolResult as never, { expanded: false }, theme as any));
@@ -314,7 +283,139 @@ test("compact multi-result cards prefer bounded workflow labels over raw tasks",
 	assert.match(text, /task: Review auth flow x+/);
 	assert.doesNotMatch(text, /raw task that should not win/);
 	assert.match(text, /\.\.\.$/m);
-	assert.match(text, /Ctrl\+Alt\+F Fleet/);
+	assert.doesNotMatch(text, /Fleet/);
+});
+
+test("workflow checklist does not map child-local result indexes onto graph nodes", () => {
+	const text = componentText(renderSubagentResult({
+		content: [{ type: "text", text: "failed" }],
+			details: {
+			mode: "workflow",
+			results: [
+				{ ...result("scout", "ok"), index: 0 },
+				{ ...result("writer", "failed"), index: 0, exitCode: 1 },
+			],
+			workflowGraph: {
+				runId: "workflow-local-indexes",
+				mode: "workflow",
+				phases: [{ title: "inventory", nodeIds: ["inventory"] }, { title: "write", nodeIds: ["writer"] }],
+				nodes: [
+					{ id: "inventory", kind: "agent", agent: "scout", label: "Inventory", status: "completed", flatIndex: 0 },
+					{ id: "writer", kind: "agent", agent: "writer", label: "Writer", status: "failed", flatIndex: 1 },
+				],
+			},
+		},
+	}, { expanded: true }, theme as any));
+
+	assert.match(text, /Checklist 1\/2 done · 1 failed/);
+	assert.match(text, /✗ write 1 failed/);
+	assert.match(text, /✗ Writer · writer · failed/);
+});
+
+test("collapsed async workflow widgets render compact lane rows while expanded widgets keep child detail", () => {
+	const now = 50_000;
+	const workflowGraph = {
+		runId: "workflow-collapsed",
+		mode: "workflow" as const,
+		phases: [
+			{ title: "inventory", nodeIds: ["inventory"] },
+			{ title: "writers", nodeIds: ["writer-a", "writer-b"] },
+			{ title: "reviews", nodeIds: ["review"] },
+			{ title: "gates", nodeIds: ["gate"] },
+		],
+		nodes: [
+			{ id: "inventory", kind: "step" as const, label: "inventory", agent: "scout", status: "completed" as const, flatIndex: 0 },
+			{ id: "writer-a", kind: "agent" as const, label: "writer-a", agent: "writer", status: "running" as const, flatIndex: 1 },
+			{ id: "writer-b", kind: "agent" as const, label: "writer-b", agent: "writer", status: "pending" as const, flatIndex: 2 },
+			{ id: "review", kind: "step" as const, label: "review", agent: "reviewer", status: "pending" as const, flatIndex: 3 },
+			{ id: "gate", kind: "step" as const, label: "gate", agent: "reviewer", status: "pending" as const, flatIndex: 4 },
+		],
+	};
+	const job: AsyncJobState = {
+		asyncId: "workflow-collapsed",
+		asyncDir: "/tmp/workflow-collapsed",
+		cwd: "/tmp/workflow",
+		status: "running",
+		mode: "workflow",
+		agents: ["scout", "writer", "reviewer"],
+		stepsTotal: 5,
+		currentStep: 1,
+		toolCount: 38,
+		startedAt: 1_000,
+		updatedAt: now,
+		workflowGraph,
+		steps: [
+			{ index: 0, workflowKey: "inventory", agent: "scout", status: "complete", description: "Inspect the repository" },
+			{ index: 1, workflowKey: "writer-a", agent: "writer", status: "running", description: "Review auth flow", currentTool: "edit", currentToolStartedAt: now - 2_000, toolCount: 19, outputName: "review-a.md" },
+			{ index: 2, workflowKey: "writer-b", agent: "writer", status: "pending", description: "Review billing flow", outputName: "review-b.md" },
+		],
+	};
+
+	const collapsed = buildWidgetLines([job], theme, 240).join("\n");
+	assert.match(collapsed, /1\/5 done · 1 active · 3 queued/);
+	assert.match(collapsed, /✓ inventory/);
+	assert.match(collapsed, /writer-a · writer · active/);
+	assert.match(collapsed, /writer-b · writer · queued/);
+	assert.match(collapsed, /review · reviewer · queued/);
+	assert.match(collapsed, /gate · reviewer · queued/);
+	assert.doesNotMatch(collapsed, /bottleneck/);
+	assert.match(collapsed, /Press configured-expand-key for details/);
+	assert.doesNotMatch(collapsed, /Fleet/);
+	assert.equal((collapsed.match(/1\/5 done · 1 active · 3 queued/g) ?? []).length, 1);
+	assert.doesNotMatch(collapsed, /Step \d\/\d|task:|workspace:|ref:|out(?:put)?:/i);
+
+	const expanded = buildWidgetLines([job], theme, 240, true).join("\n");
+	assert.match(expanded, /Stage 2\/5/);
+	assert.match(expanded, /task: .*Review auth flow/);
+	assert.match(expanded, /workspace:\/tmp\/workflow/);
+	assert.match(expanded, /out:review-a\.md/);
+	assert.match(expanded, /output: [\\/]tmp[\\/]workflow-collapsed[\\/]output-1\.log/);
+
+	const generic = buildWidgetLines([{
+		asyncId: "workflow-generic",
+		asyncDir: "/tmp/workflow-generic",
+		status: "running",
+		mode: "workflow",
+		agents: ["reviewer", "scout"],
+		stepsTotal: 2,
+		steps: [
+			{ index: 0, agent: "reviewer", status: "running" },
+			{ index: 1, agent: "scout", status: "running" },
+		],
+	} as AsyncJobState], theme, 240).join("\n");
+	assert.match(generic, /id: workflow · 0\/2 done · 2 active/);
+	assert.match(generic, /step-1 · reviewer · active · reviewer/);
+	assert.match(generic, /step-2 · scout · active · scout/);
+});
+
+test("compact foreground workflow results use checklist phases instead of child rows", () => {
+	const workflowGraph = {
+		runId: "foreground-workflow",
+		mode: "workflow" as const,
+		phases: [{ title: "inventory", nodeIds: ["inventory"] }, { title: "writers", nodeIds: ["writer"] }],
+		nodes: [
+			{ id: "inventory", kind: "step" as const, label: "inventory", agent: "scout", status: "completed" as const, flatIndex: 0 },
+			{ id: "writer", kind: "agent" as const, label: "writer", agent: "writer", status: "running" as const, flatIndex: 1 },
+		],
+	};
+	const text = componentText(renderSubagentResult({
+		content: [{ type: "text", text: "running" }],
+		details: {
+			mode: "workflow",
+			results: [
+				{ ...result("scout", "done"), workflowKey: "inventory" },
+				{ ...result("writer", ""), workflowKey: "writer", task: "raw task that should stay in expanded detail", progress: { status: "running", index: 1, agent: "writer", toolCount: 7, tokens: 0, durationMs: 2_000 } },
+			],
+			workflowGraph,
+		},
+	} as never, { expanded: false }, theme as any));
+
+	assert.match(text, /1\/2 done · 1 active/);
+	assert.match(text, /✓ inventory/);
+	assert.match(text, /writers 1 active/);
+	assert.match(text, /Press configured-expand-key for live detail/);
+	assert.doesNotMatch(text, /Fleet/);
+	assert.doesNotMatch(text, /Step \d\/\d|task:|workspace:|ref:|out(?:put)?:/i);
 });
 
 test("compact chain rendering uses workflow graph labels and parallel groups", () => {
@@ -355,23 +456,6 @@ test("compact chain rendering uses workflow graph labels and parallel groups", (
 	assert.match(text, /Review A/);
 	assert.match(text, /Review B/);
 	assert.match(text, /Step 3\/3: Writer/);
-});
-
-test("widget rendering reuses one staged workflow projection", () => {
-	let nodeReads = 0;
-	const lines = buildWidgetLines([countedWorkflowJob(() => nodeReads++)], theme as any, 120, false, 0);
-
-	assert.equal(nodeReads, 1);
-	assert.match(lines.join("\n"), /staged lane · stage 2\/2 · Review · reviewer · running/);
-	assert.match(lines.join("\n"), /Stage 2\/2: Review/);
-});
-
-test("widget render keys reuse one staged workflow projection", () => {
-	let nodeReads = 0;
-
-	widgetRenderKey(countedWorkflowJob(() => nodeReads++));
-
-	assert.equal(nodeReads, 1);
 });
 
 test("compact chain rendering shows failed zero-child dynamic fanout groups", () => {

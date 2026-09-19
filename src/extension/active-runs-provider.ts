@@ -1,7 +1,12 @@
-import { registerActiveSubagentRunSource } from "../api/active-runs.ts";
+import {
+  registerActiveSubagentRunSource,
+  type ActiveSubagentRunStatus,
+} from "../api/active-runs.ts";
 import type { AsyncJobState, SubagentState } from "../shared/types.ts";
 
-function isActive(status: AsyncJobState["status"]): boolean {
+function isActive(
+  status: AsyncJobState["status"],
+): status is ActiveSubagentRunStatus {
   return status === "queued" || status === "running" || status === "paused";
 }
 
@@ -15,7 +20,7 @@ export function registerSubagentActiveRunsProvider(
     listActiveRuns: () =>
       [...state.asyncJobs.values()].flatMap((job) => {
         if (!isActive(job.status) || !job.sessionId) return [];
-        return [{ id: job.asyncId, sessionId: job.sessionId }];
+        return [{ id: job.asyncId, sessionId: job.sessionId, status: job.status }];
       }),
   });
 }

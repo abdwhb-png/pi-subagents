@@ -75,12 +75,12 @@ describe("active subagent runs bridge", () => {
     const dispose = registerSubagentActiveRunsProvider(state, "session-a");
 
     assert.deepEqual(snapshotActiveSubagentRuns("session-a"), [
-      { id: "queued", sessionId: "session-a" },
-      { id: "running", sessionId: "session-a" },
-      { id: "paused", sessionId: "session-a" },
+      { id: "queued", sessionId: "session-a", status: "queued" },
+      { id: "running", sessionId: "session-a", status: "running" },
+      { id: "paused", sessionId: "session-a", status: "paused" },
     ]);
     assert.deepEqual(snapshotActiveSubagentRuns("session-b"), [
-      { id: "other-session", sessionId: "session-b" },
+      { id: "other-session", sessionId: "session-b", status: "running" },
     ]);
 
     dispose();
@@ -111,6 +111,13 @@ describe("active subagent runs bridge", () => {
       listActiveRuns: () => [{ id: " run", sessionId: "session-a" }],
     });
     assert.throws(() => snapshotActiveSubagentRuns("session-a"), /leading or trailing whitespace/);
+    clearRegistry();
+
+    registerActiveSubagentRunSource({
+      name: "invalid-status",
+      listActiveRuns: () => [{ id: "run-a", sessionId: "session-a", status: "complete" }] as never,
+    });
+    assert.throws(() => snapshotActiveSubagentRuns("session-a"), /invalid status/);
     clearRegistry();
 
     registerActiveSubagentRunSource({
