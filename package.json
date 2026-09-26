@@ -20,6 +20,7 @@
     "./control-channel": "./src/api/control-channel.ts",
     "./intercom-bridge": "./src/api/intercom-bridge.ts",
     "./child-tool-plan": "./src/api/child-tool-plan.ts",
+    "./tool-selection": "./src/api/tool-selection.ts",
     "./shared-types": "./src/api/shared-types.ts",
     "./project-panes": "./src/api/project-panes.ts"
   },

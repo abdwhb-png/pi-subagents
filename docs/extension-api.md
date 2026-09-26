@@ -386,6 +386,23 @@ Semantics:
 
 Schedules created while a ceiling is active are rejected until durable schedule persistence is available; unrestricted schedules remain subject to any policy active when they fire. Public status exposes bounded audit counts and sources, never full extension paths.
 
+## Child tool-selection transformer
+
+An extension can normalize an agent's tool selectors before pi-subagents computes its strict child allowlist:
+
+```ts
+import { registerSubagentToolSelectionTransformer } from "pi-subagents/tool-selection";
+
+const dispose = registerSubagentToolSelectionTransformer({
+  name: "my-tool-selector",
+  resolve({ tools }) {
+    return (tools ?? []).flatMap((name) => name === "preset:inspect" ? ["read", "grep"] : [name]);
+  },
+});
+```
+
+When declared tools are present, the callback receives those selectors together with MCP selectors, agent name, and launch cwd. It returns ordered tool selectors, including `mcp:` selectors and extension paths when needed. pi-subagents applies normal MCP/extension parsing, capability ceilings, exclusions, and child-registry verification **after** transformation. Without a transformer, behavior is unchanged. Invalid results and thrown errors fail the launch; the callback must not grant tools beyond the agent's intended configuration. Only one provider name may be active in a process; nested sessions with the same provider name restore the previous registration when disposed. Dispose on extension shutdown. For async runs, the resolved selectors are retained in the runner step rather than relying on a provider installed in the detached process.
+
 ## Background-work provider API
 
 Other Pi extensions can make their current-session jobs visible to `bg_wait` through the process-local provider contract:

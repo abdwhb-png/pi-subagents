@@ -14,6 +14,7 @@ import { createMockPi, createTempDir, events, makeAgent, makeAgentConfigs, remov
 import { runSync } from "../../src/runs/foreground/execution.ts";
 import { childSessionFactory, createDefaultChildSessionFactory, disposeChildSessions, type ChildSessionFactory, type ChildSessionLaunch, type PiCodingAgentModule } from "../../src/runs/shared/child-session.ts";
 import { createNestedRoute } from "../../src/runs/shared/nested-events.ts";
+import { registerSubagentToolSelectionTransformer } from "../../src/api/tool-selection.ts";
 import { createStructuredOutputRuntime } from "../../src/runs/shared/structured-output.ts";
 import { rewriteSubagentPrompt } from "../../src/runs/shared/subagent-prompt-runtime.ts";
 import type { ForegroundChildSessionControls, SingleResult } from "../../src/shared/types.ts";
@@ -76,6 +77,18 @@ describe("in-process foreground child", () => {
 		mockPi.onCall({ output: "done" }); const base = childSessionFactory(); const wrapped: ChildSessionFactory = { async create(input) { const child = await base.create(input); Object.defineProperty(child, "machineEvidence", { value: { machineId: "remote-machine", initial: { head: "aaa", dirty: false }, final: { head: "bbb", dirty: true } } }); return child; }, dispose: () => base.dispose() };
 		const result = await runSync(tempDir, makeAgentConfigs(["echo"]), "echo", "Task", { runId: "native-git-evidence", waitToolEnabled: false, childSessionFactory: wrapped });
 		assert.deepEqual(result.nativeMachine, { provider: "herdr", machineId: "remote-machine", initialGit: { head: "aaa", dirty: false }, finalGit: { head: "bbb", dirty: true } });
+	});
+
+	it("passes transformed selectors, not placeholders, to the child session", async (t) => {
+		const dispose = registerSubagentToolSelectionTransformer({
+			name: "fixture-selector",
+			resolve: ({ tools }) => (tools ?? []).flatMap((tool) => tool === "fixture:inspect" ? ["read", "grep"] : [tool]),
+		});
+		t.after(dispose);
+		mockPi.onCall({ output: "done" });
+		const result = await runSync(tempDir, [makeAgent("verifier", { tools: ["fixture:inspect"] })], "verifier", "Inspect", { runId: "resolved-tools" });
+		assert.equal(result.exitCode, 0);
+		assert.deepEqual(mockPi.sessions[0]?.launch.tools, ["read", "grep"]);
 	});
 
 	it("adds the fanout hook and nested route only for fanout-authorized children", async () => {

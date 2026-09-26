@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { describe, it } from "node:test";
 import { resolvePiLaunchToolPlan } from "../../src/runs/shared/child-tool-plan.ts";
 import { buildInProcessChildLaunch } from "../../src/runs/shared/child-launch.ts";
+import { registerSubagentToolSelectionTransformer } from "../../src/api/tool-selection.ts";
 import { MCP_RUNTIME_SNAPSHOT_EVENT, MCP_RUNTIME_SNAPSHOT_VERSION, type McpRuntimeSnapshotHost } from "../../src/runs/shared/mcp-direct-tool-allowlist.ts";
 
 /** A parent whose pi-mcp-adapter answers snapshot requests for one runtime-only server. */
@@ -43,6 +44,21 @@ describe("child tool plan", () => {
 });
 
 describe("child tool plan declared tools", () => {
+	it("transforms declared selectors before applying the capability ceiling", (t) => {
+		const dispose = registerSubagentToolSelectionTransformer({
+			name: "fixture-selector",
+			resolve: ({ tools }) => (tools ?? []).flatMap((tool) => tool === "fixture:inspect" ? ["read", "grep"] : [tool]),
+		});
+		t.after(dispose);
+		const unrestricted = resolvePiLaunchToolPlan({ tools: ["fixture:inspect"], agentName: "verifier" });
+		assert.deepEqual(unrestricted.effectiveToolAllowlist, ["read", "grep"]);
+		const restricted = resolvePiLaunchToolPlan({
+			tools: ["fixture:inspect"], agentName: "verifier",
+			capabilityCeiling: { version: 1, allowedTools: ["read"], denyExtensions: false, sources: ["test"] },
+		});
+		assert.deepEqual(restricted.effectiveToolAllowlist, ["read"]);
+		assert.deepEqual(restricted.requiredChildTools, ["read"]);
+	});
 	it("keeps every declared core tool, so the child registry decides what exists", () => {
 		const plan = resolvePiLaunchToolPlan({ tools: ["read", "grep", "find", "ls", "bash"], agentName: "verifier" });
 		assert.deepEqual(plan.declaredBuiltinTools, ["read", "grep", "find", "ls", "bash"]);

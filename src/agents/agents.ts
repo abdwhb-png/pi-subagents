@@ -26,6 +26,7 @@ import { validatePermissionRules, type PermissionRules } from "../runs/shared/pe
 import { parseThinkingLevel, type ThinkingLevel } from "../shared/thinking-ceiling.ts";
 import { assertJsonSchemaObject } from "../runs/shared/structured-output.ts";
 import { normalizeCapabilityCeilingAllowedAgents } from "../runs/shared/capability-ceiling.ts";
+import { splitToolSelectors } from "../api/tool-selection.ts";
 
 export type AgentScope = "user" | "project" | "both";
 
@@ -732,22 +733,6 @@ export function resolveAgentName(name: string, agents: AgentConfig[]): { agent?:
 	return {};
 }
 
-function splitToolList(rawTools: string[] | undefined): { tools?: string[]; mcpDirectTools?: string[] } {
-	const mcpDirectTools: string[] = [];
-	const tools: string[] = [];
-	for (const tool of rawTools ?? []) {
-		if (tool.startsWith("mcp:")) {
-			mcpDirectTools.push(tool.slice(4));
-		} else {
-			tools.push(tool);
-		}
-	}
-	return {
-		...(rawTools !== undefined ? { tools } : {}),
-		...(mcpDirectTools.length > 0 ? { mcpDirectTools } : {}),
-	};
-}
-
 function joinToolList(config: Pick<AgentConfig, "tools" | "mcpDirectTools">): string[] | undefined {
 	const joined = [
 		...(config.tools ?? []),
@@ -1432,7 +1417,7 @@ function applyToolsOverride(target: AgentConfig, toolsOverride: string[] | false
 		delete target.mcpDirectTools;
 		return;
 	}
-	const { tools, mcpDirectTools } = splitToolList(toolsOverride === false ? [] : toolsOverride);
+	const { tools, mcpDirectTools } = splitToolSelectors(toolsOverride === false ? [] : toolsOverride);
 	if (tools === undefined) delete target.tools; else target.tools = tools;
 	if (mcpDirectTools === undefined) delete target.mcpDirectTools; else target.mcpDirectTools = mcpDirectTools;
 }
@@ -2111,7 +2096,7 @@ function loadAgentsFromDefinitionFiles(files: AgentDefinitionFile[], source: Age
 			else throw new Error(`Agent '${localName}' has invalid advertise frontmatter; expected true or false.`);
 		}
 		const rawTools = parseFrontmatterList(frontmatter.tools);
-		const parsedTools = splitToolList(rawTools);
+		const parsedTools = splitToolSelectors(rawTools);
 		const tools = parsedTools.tools ?? [];
 		const mcpDirectTools = parsedTools.mcpDirectTools ?? [];
 		const excludeTools = parseFrontmatterList(frontmatter.excludeTools);

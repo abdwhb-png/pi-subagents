@@ -21,6 +21,7 @@ import {
 } from "../../shared/types.ts";
 import { THINKING_LEVELS } from "../../shared/model-info.ts";
 import { getAgentDir } from "../../shared/utils.ts";
+import { resolveSubagentToolSelection, splitToolSelectors } from "../../api/tool-selection.ts";
 import type { PermissionRules } from "./permissions.ts";
 import { snapshotRequiredChildExtensions, type RequiredChildExtensionSnapshot } from "../../shared/required-child-extensions.ts";
 import {
@@ -154,6 +155,8 @@ export interface ResolvePiLaunchToolPlanInput {
 
 export interface PiLaunchToolPlan {
 	capabilityCeiling?: ResolvedSubagentCapabilityCeiling;
+	resolvedDeclaredTools?: string[];
+	resolvedMcpDirectTools?: string[];
 	requestedBuiltinTools: string[];
 	declaredBuiltinTools: string[];
 	excludeTools: string[];
@@ -303,12 +306,16 @@ export function resolvePiLaunchToolPlan(
 	if (requiredExtensions.length > 0 && capabilityCeiling?.denyExtensions) {
 		throw new Error(`Capability ceiling from ${capabilityCeiling.sources.join(", ") || "unknown source"} denies extensions but this host requires: ${requiredExtensions.map(({ id }) => id).join(", ")}.`);
 	}
+	const transformed = resolveSubagentToolSelection(input);
+	const selection = transformed === undefined
+		? { tools: input.tools, mcpDirectTools: input.mcpDirectTools }
+		: splitToolSelectors(transformed);
 	const allowedToolSet =
 		capabilityCeiling?.allowedTools === undefined
 			? undefined
 			: new Set(capabilityCeiling.allowedTools);
 	const requestedBuiltinTools =
-		input.tools?.filter(
+		selection.tools?.filter(
 			(tool) =>
 				!(tool.includes("/") || tool.endsWith(".ts") || tool.endsWith(".js")),
 		) ?? [];
@@ -318,7 +325,7 @@ export function resolvePiLaunchToolPlan(
 		);
 	}
 	const ceilingFilteredBuiltinTools =
-		input.tools === undefined
+		selection.tools === undefined
 			? allowedToolSet
 				? [...allowedToolSet]
 				: []
@@ -343,14 +350,14 @@ export function resolvePiLaunchToolPlan(
 	}
 	const toolExtensionPaths: string[] = capabilityCeiling?.denyExtensions
 		? []
-		: (input.tools ?? []).filter(
+		: (selection.tools ?? []).filter(
 				(tool) =>
 					!requestedBuiltinTools.includes(tool) &&
 					(tool.includes("/") || tool.endsWith(".ts") || tool.endsWith(".js")),
 			);
 	const mcpResolution = capabilityCeiling?.denyExtensions
 		? { selections: [], unresolvedSelectors: [] }
-		: resolveMcpDirectToolResolution(input.mcpDirectTools, input.cwd, input.runtimeSnapshotHost);
+		: resolveMcpDirectToolResolution(selection.mcpDirectTools, input.cwd, input.runtimeSnapshotHost);
 	if (mcpResolution.runtimeServerNames?.length) {
 		throw new Error(formatRuntimeSnapshotMcpServersError(input.agentName, mcpResolution.runtimeServerNames));
 	}
@@ -370,8 +377,8 @@ export function resolvePiLaunchToolPlan(
 		(selection) => selection.name,
 	);
 	const explicitToolAllowlist =
-		input.tools !== undefined ||
-		(input.mcpDirectTools?.length ?? 0) > 0 ||
+		selection.tools !== undefined ||
+		(selection.mcpDirectTools?.length ?? 0) > 0 ||
 		allowedToolSet !== undefined;
 	const internalTools = (input.structuredOutput ? ["structured_output"] : []).filter((tool) => !excludedToolSet.has(tool));
 	const effectiveToolAllowlist = [
@@ -391,8 +398,8 @@ export function resolvePiLaunchToolPlan(
 	const requiredChildTools = explicitToolAllowlist
 		? [
 				...new Set([
-					...(input.tools !== undefined ? effectiveDeclaredBuiltinTools : []),
-					...(input.mcpDirectTools?.length ? effectiveMcpTools : []),
+					...(selection.tools !== undefined ? effectiveDeclaredBuiltinTools : []),
+					...(selection.mcpDirectTools?.length ? effectiveMcpTools : []),
 					...internalTools,
 				].filter((tool) => tool !== "contact_supervisor" && (!legacySupervisorPairing || tool !== "intercom"))),
 			]
@@ -442,7 +449,7 @@ export function resolvePiLaunchToolPlan(
 	// Host-required paths have final precedence and cannot be removed by agent defaults or overrides.
 	const extensionArgs = [...new Set([...ordinaryExtensionArgs, ...requiredExtensions.map(({ path }) => path)])];
 	const requestedToolNames =
-		input.tools !== undefined
+		selection.tools !== undefined
 			? [
 					...new Set([
 						...requestedBuiltinTools,
@@ -465,14 +472,14 @@ export function resolvePiLaunchToolPlan(
 				removedExtensionCount: capabilityCeiling.denyExtensions
 					? (input.extensions?.length ?? 0) +
 						(input.subagentOnlyExtensions?.length ?? 0) +
-						(input.tools ?? []).filter(
+						(selection.tools ?? []).filter(
 							(tool) =>
 								tool.includes("/") ||
 								tool.endsWith(".ts") ||
 								tool.endsWith(".js"),
 						).length
 					: 0,
-				requestedMcpToolCount: input.mcpDirectTools?.length ?? 0,
+				requestedMcpToolCount: selection.mcpDirectTools?.length ?? 0,
 				effectiveMcpTools,
 				agentAllowed:
 					input.agentName === undefined
@@ -491,6 +498,8 @@ export function resolvePiLaunchToolPlan(
 		: undefined;
 	return {
 		...(capabilityCeiling ? { capabilityCeiling } : {}),
+		...(selection.tools !== undefined ? { resolvedDeclaredTools: selection.tools } : {}),
+		...(selection.mcpDirectTools !== undefined ? { resolvedMcpDirectTools: selection.mcpDirectTools } : {}),
 		requestedBuiltinTools,
 		declaredBuiltinTools,
 		excludeTools,

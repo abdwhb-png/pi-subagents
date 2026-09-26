@@ -8,6 +8,8 @@ import { buildAsyncRunnerSteps, DEFAULT_ASYNC_TIMEOUT_MS, emitProcessTerminalEve
 import type { AgentConfig } from "../../src/agents/agents.ts";
 import { SUBAGENT_PROCESS_TERMINAL_EVENT } from "../../src/shared/types.ts";
 import { registerRequiredChildExtensions } from "../../src/api/required-child-extensions.ts";
+import { registerSubagentToolSelectionTransformer } from "../../src/api/tool-selection.ts";
+import { resolvePiLaunchToolPlan } from "../../src/api/child-tool-plan.ts";
 
 const agent = (name: string, toolBudget?: AgentConfig["toolBudget"]): AgentConfig => ({
 	name,
@@ -30,6 +32,25 @@ const ctx = {
 };
 
 describe("async runner execution", () => {
+	it("persists transformed tool names instead of the source selectors", (t) => {
+		const dispose = registerSubagentToolSelectionTransformer({
+			name: "fixture-selector",
+			resolve: ({ tools }) => (tools ?? []).flatMap((tool) => tool === "fixture:inspect" ? ["read", "grep"] : [tool]),
+		});
+		t.after(dispose);
+		const result = buildAsyncRunnerSteps("resolved-tools", {
+			chain: [{ agent: "worker", task: "Inspect" }],
+			agents: [{ ...agent("worker"), tools: ["fixture:inspect"] }],
+			ctx,
+			asyncDir: path.join(process.cwd(), ".tmp-tool-selection-test"),
+			maxSubagentDepth: 1,
+		});
+		assert.ok("steps" in result);
+		assert.deepEqual(result.steps[0]?.tools, ["read", "grep"]);
+		dispose(); // A detached runner has no parent-process transformer.
+		const resumedPlan = resolvePiLaunchToolPlan({ tools: result.steps[0]?.tools });
+		assert.deepEqual(resumedPlan.requiredChildTools, ["read", "grep"]);
+	});
 	it("propagates static parallel machine placement before agent pins and rejects group worktrees", { skip: process.platform === "win32" ? "Herdr saved-machine launches are unsupported on Windows" : undefined }, (t) => {
 		const bin = fs.mkdtempSync(path.join(os.tmpdir(), "herdr-bin-"));
 		const herdr = path.join(bin, "herdr");
