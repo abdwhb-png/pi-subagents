@@ -536,6 +536,39 @@ describe("builtin agent overrides", () => {
 		);
 	});
 
+	it("keeps user builtin model and thinking when project overrides only tools", () => {
+		writeJson(path.join(tempHome, ".pi", "agent", "settings.json"), {
+			subagents: { agentOverrides: { reviewer: { model: "fixture/user-model", thinking: "high" } } },
+		});
+		writeJson(path.join(tempProject, ".pi", "settings.json"), {
+			subagents: { agentOverrides: { reviewer: { tools: ["read"] } } },
+		});
+
+		const reviewer = discoverAgents(tempProject, "both").agents.find((agent) => agent.name === "reviewer");
+		assert.ok(reviewer);
+		assert.equal(reviewer.model, "fixture/user-model");
+		assert.equal(reviewer.thinking, "high");
+		assert.deepEqual(reviewer.tools, ["read"]);
+		assert.deepEqual(reviewer.override?.fieldScopes, { model: ["user"], thinking: ["user"], tools: ["project"] });
+	});
+
+	it("layers builtin tools without losing provider selection, false values or scope", () => {
+		writeJson(path.join(tempHome, ".pi", "agent", "settings.json"), {
+			subagents: { agentOverrides: { reviewer: { model: "fixture/default", thinking: false } }, agentOverridesByProvider: { fixture: { reviewer: { model: "fixture/provider", thinking: "high" } } } },
+		});
+		writeJson(path.join(tempProject, ".pi", "settings.json"), { subagents: { agentOverrides: { reviewer: { tools: ["read"] } } } });
+		const resolve = (scope: "both" | "user", provider?: string) => discoverAgents(tempProject, scope, provider).agents.find(agent => agent.name === "reviewer")!;
+		assert.equal(Object.hasOwn(resolve("both"), "thinking"), false);
+		assert.deepEqual(resolve("both").override?.fieldScopes.thinking, ["user"]);
+		assert.equal(resolve("both", "fixture").model, "fixture/provider");
+		assert.equal(resolve("both", "fixture").thinking, "high");
+		assert.equal(resolve("user").model, "fixture/default");
+		assert.equal(resolve("user").override?.scope, "user");
+		writeJson(path.join(tempProject, ".pi", "settings.json"), { subagents: { disableThinking: true, agentOverrides: { reviewer: { tools: ["read"] } } } });
+		assert.equal(resolve("both", "fixture").model, "fixture/provider");
+		assert.equal(resolve("both", "fixture").thinking, undefined);
+	});
+
 	it("prefers project settings overrides over user settings overrides", () => {
 		fs.mkdirSync(path.join(tempProject, ".pi"), { recursive: true });
 		writeJson(path.join(tempHome, ".pi", "agent", "settings.json"), {
