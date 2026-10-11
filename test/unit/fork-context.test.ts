@@ -220,6 +220,8 @@ describe("createForkContextResolver", () => {
 
 			assert.ok(parentSessionFile);
 			assert.ok(leafId);
+			// Pi 1.1 persists user messages eagerly. Remove only the fixture file to exercise a missing persisted parent.
+			fs.rmSync(parentSessionFile, { force: true });
 			assert.equal(fs.existsSync(parentSessionFile), false);
 
 			const resolver = createForkContextResolver(parent, "fork");
