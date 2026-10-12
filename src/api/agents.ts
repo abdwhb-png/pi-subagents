@@ -10,3 +10,7 @@ export {
 } from "../agents/runtime-agent-events.ts";
 
 export type { RegisterRuntimeAgentInput, RuntimeAgentDefinition, RuntimeAgentRegistration };
+
+export { discoverAgents } from "../agents/agents.ts";
+export type { AgentConfig, AgentScope, AgentDiscoveryOptions, AgentDiscoveryResult, AgentDiscoveryDiagnostic } from "../agents/agents.ts";
+export type { ToolSelectionRequest, ToolSelectionResult, ToolSelectionResolver } from "../agents/host-tool-selection.ts";

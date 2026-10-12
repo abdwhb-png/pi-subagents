@@ -2,6 +2,7 @@
  * Agent discovery and configuration
  */
 
+import { resolveHostToolSelections } from "./host-tool-selection.ts";
 import { execSync } from "node:child_process";
 import * as fs from "node:fs";
 import { parse as parseYaml } from "yaml";
@@ -263,6 +264,7 @@ export interface ChainDiscoveryDiagnostic {
 }
 
 export interface AgentDiscoveryDiagnostic extends ChainDiscoveryDiagnostic {
+	acceptedNames?: string[];
 	name?: string;
 	runtimeName?: string;
 	packageSpecified?: boolean;
@@ -287,7 +289,7 @@ export function findBlockingAgentDiagnostic(name: string, agent: AgentConfig | r
 	const agents = Array.isArray(agent) ? agent : agent ? [agent] : [];
 	let match: AgentDiscoveryDiagnostic | undefined;
 	for (const diagnostic of diagnostics ?? []) {
-		if ((diagnostic.runtimeName === normalizedName
+		if ((diagnostic.acceptedNames?.includes(normalizedName) || diagnostic.runtimeName === normalizedName
 			|| (diagnostic.name === normalizedName && (!diagnostic.packageSpecified
 				|| diagnostic.runtimeName === undefined
 				|| agents.some((agent) => agent.name === diagnostic.runtimeName && agent.localName === diagnostic.name))))
@@ -2953,15 +2955,44 @@ function discoveryDiagnostics(sources: AgentDiscoverySources, scope: AgentScope)
 	];
 }
 
-function buildEffectiveDiscovery(sources: AgentDiscoverySources, scope: AgentScope): AgentDiscoveryResult {
+function resolveEffectiveToolSelections(agents: AgentConfig[], diagnostics: AgentDiscoveryDiagnostic[], cwd: string, scope: AgentScope, projectTrusted: boolean): AgentConfig[] {
+	const selected = agents.filter(agent => (agent.tools?.length ?? 0) > 0 || (agent.mcpDirectTools?.length ?? 0) > 0);
+	const results = resolveHostToolSelections({
+		cwd, agentDir: getAgentDir(), scope, projectTrusted,
+		selections: selected.map(agent => ({ agentName: agent.name, selectors: joinToolList(agent) ?? [] })),
+	});
+	const byAgent = new Map(selected.map((agent, index) => [agent, results[index]!]));
+	return agents.flatMap(agent => {
+		const result = byAgent.get(agent);
+		if (result && !result.ok) {
+			diagnostics.push({ source: agent.source, filePath: agent.filePath, name: agent.localName ?? agent.name,
+				runtimeName: agent.name, packageSpecified: agent.packageName !== undefined, discoveryPriority: agent.discoveryPriority,
+				acceptedNames: [...new Set([agent.name, agent.localName ?? agent.name, ...(agent.aliases ?? [])])], error: result.error });
+			return [];
+		}
+		const next = { ...agent };
+		if (!result && agent.tools !== undefined) next.tools = [...agent.tools];
+		if (result?.ok) {
+			delete next.tools;
+			delete next.mcpDirectTools;
+			Object.assign(next, splitToolList(result.selectors));
+		}
+		const fields = agentFrontmatterFields.get(agent);
+		if (fields) agentFrontmatterFields.set(next, fields);
+		return [next];
+	});
+}
+
+function buildEffectiveDiscovery(sources: AgentDiscoverySources, scope: AgentScope, projectTrusted = true): AgentDiscoveryResult {
 	const configured = configuredAgentsForScope(sources, scope);
 	const merged = mergeAgentsForScope(scope, configured.user, configured.project, configured.builtin, configured.package);
-	const agents = applySubagentMaxThinking(merged.filter((agent) => agent.disabled !== true), configured.maxThinking);
+	const diagnostics = discoveryDiagnostics(sources, scope);
+	const agents = resolveEffectiveToolSelections(applySubagentMaxThinking(merged.filter((agent) => agent.disabled !== true), configured.maxThinking), diagnostics, sources.cwd, scope, projectTrusted);
 	const disabledAgents = merged.filter((agent) => agent.disabled === true).map((agent) => agent.name);
 	return {
 		agents,
 		...(disabledAgents.length ? { disabledAgents } : {}),
-		agentDiagnostics: discoveryDiagnostics(sources, scope),
+		agentDiagnostics: diagnostics,
 		projectAgentsDir: sources.projectAgentsDir,
 		cwd: sources.cwd,
 		scope,
@@ -3025,7 +3056,7 @@ export function discoverAgentSnapshot(
 	const projectTrusted = options.projectTrusted !== false;
 	const trustedScope = trustedDiscoveryScope(cwd, scope, projectTrusted);
 	const sources = getAgentDiscoverySources(cwd, preferredModelProvider, includeChains, options.globalNpmRoot, projectTrusted);
-	return { effective: buildEffectiveDiscovery(sources, trustedScope), all: buildAllDiscovery(sources, includeChains, trustedScope) };
+	return { effective: buildEffectiveDiscovery(sources, trustedScope, projectTrusted), all: buildAllDiscovery(sources, includeChains, trustedScope) };
 }
 
 // Pi loads nothing from an untrusted project's `.pi` directory, so declined trust leaves user scope.
@@ -3083,9 +3114,10 @@ function discoverAgentsUncached(cwd: string, scope: AgentScope, preferredModelPr
 	for (const loaded of packageLoaded) for (const agent of loaded.agents) if (!packageMap.has(agent.name)) packageMap.set(agent.name, agent);
 	const packageAgents = applyCustomAgentOverrides(applyDefaults(Array.from(packageMap.values())), userSettings, projectSettings, userSettingsPath, projectSettingsPath);
 	const merged = mergeAgentsForScope(scope, userAgents, projectAgents, builtinAgents, packageAgents);
-	const agents = applySubagentMaxThinking(merged.filter((agent) => agent.disabled !== true), maxThinking);
+	const unresolved = applySubagentMaxThinking(merged.filter((agent) => agent.disabled !== true), maxThinking);
 	const disabledAgents = merged.filter((agent) => agent.disabled === true).map((agent) => agent.name);
 	const agentDiagnostics = [...builtinLoaded.diagnostics, ...userLoaded.flatMap((loaded) => loaded.diagnostics), ...projectLoaded.flatMap((loaded) => loaded.diagnostics), ...packageLoaded.flatMap((loaded) => loaded.diagnostics)];
+	const agents = resolveEffectiveToolSelections(unresolved, agentDiagnostics, effectiveCwd, scope, options.projectTrusted !== false);
 	return { agents, ...(disabledAgents.length ? { disabledAgents } : {}), agentDiagnostics, projectAgentsDir, cwd: effectiveCwd, scope, directories, ...(modelScope !== undefined ? { modelScope } : {}), ...(maxThinking !== undefined ? { maxThinking } : {}) };
 }
 
@@ -3095,7 +3127,7 @@ export function discoverAgents(cwd: string, scope: AgentScope, preferredModelPro
 	// The uncached path always loads the project's own package.json entries.
 	if (projectTrusted && trustedScope !== "both") return discoverAgentsUncached(cwd, trustedScope, preferredModelProvider, options);
 	const sources = getAgentDiscoverySources(cwd, preferredModelProvider, false, options.globalNpmRoot, projectTrusted);
-	return buildEffectiveDiscovery(sources, trustedScope);
+	return buildEffectiveDiscovery(sources, trustedScope, projectTrusted);
 }
 
 export function discoverAgentsAll(cwd: string, preferredModelProvider?: string, options: AgentDiscoveryOptions = {}): AgentDiscoveryAllResult {

@@ -815,7 +815,7 @@ describe("builtin agent overrides", () => {
 		assert.equal(reviewer.override, undefined);
 	});
 
-	it("does not read malformed out-of-scope settings files", () => {
+	it("reports malformed global resolver settings even in project scope", () => {
 		fs.mkdirSync(path.join(tempProject, ".pi"), { recursive: true });
 		fs.mkdirSync(path.join(tempHome, ".pi", "agent"), { recursive: true });
 		fs.writeFileSync(path.join(tempHome, ".pi", "agent", "settings.json"), '{"subagents":', "utf-8");
@@ -823,10 +823,10 @@ describe("builtin agent overrides", () => {
 			subagents: { agentOverrides: { reviewer: { model: "openai-codex/gpt-5.4-mini" } } },
 		});
 
-		const reviewer = discoverAgents(tempProject, "project").agents.find((agent) => agent.name === "reviewer");
-		assert.ok(reviewer);
-		assert.equal(reviewer.model, "openai-codex/gpt-5.4-mini");
-		assert.equal(reviewer.override?.scope, "project");
+		const discovered = discoverAgents(tempProject, "project");
+		assert.equal(discovered.agents.find(agent => agent.name === "reviewer"), undefined);
+		assert.match(discovered.agentDiagnostics?.find(diagnostic => diagnostic.runtimeName === "reviewer")?.error ?? "", /Cannot read tool-selection settings/);
+
 	});
 
 	it("agentOverrides replace frontmatter for a shadowing project agent", () => {
