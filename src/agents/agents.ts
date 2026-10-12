@@ -284,21 +284,29 @@ function agentDefinitionPriority(definition: Pick<AgentConfig | AgentDiscoveryDi
 		+ (definition.discoveryPriority ?? 0);
 }
 
+function agentNameMatchRank(name: string, canonical: string | undefined, local: string | undefined, aliases: readonly string[] | undefined): number {
+	if (canonical === name) return 3;
+	if (local === name) return 2;
+	return aliases?.includes(name) ? 1 : 0;
+}
+
 export function findBlockingAgentDiagnostic(name: string, agent: AgentConfig | readonly AgentConfig[] | undefined, diagnostics: AgentDiscoveryDiagnostic[] | undefined): AgentDiscoveryDiagnostic | undefined {
 	const normalizedName = name.trim();
 	const agents = Array.isArray(agent) ? agent : agent ? [agent] : [];
+	const agentMatchRank = Math.max(...agents.map(agent => agentNameMatchRank(normalizedName, agent.name, agent.localName, agent.aliases)), 0);
 	let match: AgentDiscoveryDiagnostic | undefined;
+	let matchRank = 0;
 	for (const diagnostic of diagnostics ?? []) {
-		if ((diagnostic.acceptedNames?.includes(normalizedName) || diagnostic.runtimeName === normalizedName
-			|| (diagnostic.name === normalizedName && (!diagnostic.packageSpecified
-				|| diagnostic.runtimeName === undefined
-				|| agents.some((agent) => agent.name === diagnostic.runtimeName && agent.localName === diagnostic.name))))
-			&& (!match || agentDefinitionPriority(diagnostic) > agentDefinitionPriority(match))) {
+		const rank = agentNameMatchRank(normalizedName,
+			diagnostic.runtimeName ?? diagnostic.name,
+			diagnostic.name, diagnostic.acceptedNames);
+		if (rank > 0 && (rank > matchRank || (rank === matchRank && (!match || agentDefinitionPriority(diagnostic) > agentDefinitionPriority(match))))) {
 			match = diagnostic;
+			matchRank = rank;
 		}
 	}
 	const highestPriority = Math.max(...agents.map(agentDefinitionPriority), -Infinity);
-	return !agents.length || (match && agentDefinitionPriority(match) > highestPriority) ? match : undefined;
+	return !agents.length || matchRank > agentMatchRank || (matchRank === agentMatchRank && match && agentDefinitionPriority(match) > highestPriority) ? match : undefined;
 }
 
 export type AgentDefinitionDirectoryState = "absent" | "empty" | "candidates" | "unreadable" | "not-directory";
@@ -742,7 +750,7 @@ function effectiveAgentMatch(matches: AgentConfig[]): { agent?: AgentConfig; err
 
 export function resolveAgentName(name: string, agents: AgentConfig[]): { agent?: AgentConfig; error?: string } {
 	const raw = name.trim();
-	const canonical = agents.filter((agent) => agent.name === raw);
+	const canonical = agents.filter((agent) => agentNameMatchRank(raw, agent.name, agent.localName, agent.aliases) === 3);
 	if (canonical.length === 1) return canonical[0] ? { agent: canonical[0] } : {};
 	if (canonical.length > 1) {
 		const effective = effectiveAgentMatch(canonical);
@@ -750,7 +758,7 @@ export function resolveAgentName(name: string, agents: AgentConfig[]): { agent?:
 		return { error: `Ambiguous agent name '${name}': ${canonical.map((agent) => agent.name).join(", ")}` };
 	}
 
-	const local = agents.filter((agent) => agent.localName === raw);
+	const local = agents.filter((agent) => agentNameMatchRank(raw, agent.name, agent.localName, agent.aliases) === 2);
 	if (local.length === 1) return local[0] ? { agent: local[0] } : {};
 	if (local.length > 1) {
 		const effective = effectiveAgentMatch(local);
@@ -758,7 +766,7 @@ export function resolveAgentName(name: string, agents: AgentConfig[]): { agent?:
 		return { error: `Ambiguous local agent name '${name}': ${local.map((agent) => agent.name).join(", ")}` };
 	}
 
-	const aliases = agents.filter((agent) => agent.aliases?.includes(raw));
+	const aliases = agents.filter((agent) => agentNameMatchRank(raw, agent.name, agent.localName, agent.aliases) === 1);
 	if (aliases.length === 1) return aliases[0] ? { agent: aliases[0] } : {};
 	if (aliases.length > 1) {
 		const effective = effectiveAgentMatch(aliases);

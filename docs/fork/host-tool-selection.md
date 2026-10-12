@@ -8,4 +8,6 @@ Only the loaded callable is cached by canonical path. Providers must re-read con
 
 Errors become agent discovery diagnostics carrying canonical, local and alias identities. Affected effective agents are omitted, preventing fresh launches. Raw declaration views remain unchanged. Existing recovery descriptors still supply persisted tools when the current agent cannot be resolved. Runtime-registered agents are unchanged and continue to use concrete lists. Invalid global resolver settings are diagnosed even in project-only scope because the executable provider is a global setting.
 
+Diagnostic matching preserves native canonical, local and alias precedence before source priority, so a rejected alias cannot block a different valid canonical agent. Provider batches and selector arrays must be dense. Validation uses the original batch cardinality even if provider code mutates its request, and malformed outputs produce diagnostics rather than retaining raw permissions or rejecting public preflight with an exception.
+
 The host is responsible for group policy. This fork does not import private harness modules, scan a second agent tree or generate settings overrides. Native launch planning, availability, ceilings, MCP authorization and resume retain their owners.

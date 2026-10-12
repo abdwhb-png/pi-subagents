@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, it } from "node:test";
 import { discoverAgents, discoverAgentsAll, discoverAgentSnapshot, findBlockingAgentDiagnostic } from "../../src/agents/agents.ts";
+import { resolveSubagentLaunchContract } from "../../src/api/preflight.ts";
 
 const originalEnv = { ...process.env };
 let root: string;
@@ -135,4 +136,49 @@ it("does not expose mutable empty selections from the raw discovery cache", () =
 	assert.ok(selected?.tools);
 	selected.tools.push("write");
 	assert.deepEqual(discoverAgentsAll(cwd).user.find(a=>a.name === "empty")?.tools, []);
+});
+
+for (const [label, definition, requested] of [
+	["local name", "name: worker\npackage: alpha", "worker"],
+	["alias", "name: broken\naliases: fixture", "fixture"],
+] as const) it(`does not let a failed ${label} block a healthy canonical public launch`, async () => {
+	fs.writeFileSync(provider, `export function resolveTools({selections}) { return selections.map(({selectors}) => selectors.includes("@broken") ? {ok:false,error:"Fixture missing group"} : {ok:true,selectors:selectors.flatMap(s => s === "@inspect" ? ["read"] : [s])}); }`);
+	const directory = label === "local name" ? path.join(agentDir, "agents") : path.join(cwd, ".pi", "agents");
+	fs.mkdirSync(directory, { recursive: true });
+	fs.writeFileSync(path.join(directory, "broken.md"), `---\n${definition}\ndescription: Broken fixture\ntools: '@broken'\n---\nFixture.\n`);
+	const result = await resolveSubagentLaunchContract({
+		agent: requested, cwd, agentScope: "both", projectTrusted: true, artifacts: false,
+		model: "fixture/model", availableModels: [{provider:"fixture",id:"model"}],
+	});
+	assert.equal(result.ok, true, JSON.stringify(result));
+});
+
+it("blocks a failed canonical identity instead of falling through to a healthy alias", async () => {
+	fs.writeFileSync(provider, `export function resolveTools({selections}) { return selections.map(({selectors}) => selectors.includes("@broken") ? {ok:false,error:"Fixture missing group"} : {ok:true,selectors:["read"]}); }`);
+	const directory = path.join(cwd, ".pi", "agents");
+	fs.mkdirSync(directory, {recursive:true});
+	fs.writeFileSync(path.join(directory, "fixture.md"), "---\nname: fixture\naliases: requested\ndescription: Healthy project alias\ntools: read\n---\nFixture.\n");
+	agent("requested", "@broken");
+	const result = await resolveSubagentLaunchContract({agent:"requested", cwd, agentScope:"both", projectTrusted:true, artifacts:false});
+	assert.equal(result.ok, false);
+	if (!result.ok) assert.match(result.message, /Fixture missing group/);
+});
+
+for (const [label, source] of [
+	["sparse batch", "export function resolveTools({selections}) { return new Array(selections.length); }"],
+	["sparse selectors", "export function resolveTools({selections}) { return selections.map(() => ({ok:true,selectors:Array(1)})); }"],
+	["mutated cardinality", "export function resolveTools(request) { request.selections.length = 0; return []; }"],
+	["mutated cardinality before throwing", "export function resolveTools(request) { request.selections.length = 0; throw new Error('Fixture provider failure'); }"],
+] as const) it(`rejects malformed provider ${label} through discovery and public preflight`, async () => {
+	agent("fixture", "read, write");
+	fs.writeFileSync(provider, source);
+	const discovery = discoverAgents(cwd, "both");
+	assert.equal(discovery.agents.some(a => a.name === "fixture"), false);
+	assert.ok(findBlockingAgentDiagnostic("fixture", undefined, discovery.agentDiagnostics));
+	const result = await resolveSubagentLaunchContract({
+		agent:"fixture", cwd, agentScope:"both", projectTrusted:true, artifacts:false,
+		model:"fixture/model", availableModels:[{provider:"fixture",id:"model"}],
+	});
+	assert.equal(result.ok, false);
+	if (!result.ok) assert.equal(result.code, "missing_agent");
 });

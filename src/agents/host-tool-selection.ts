@@ -60,7 +60,8 @@ function loadProvider(agentDir: string, codec: ReturnType<typeof createCodecs>) 
 
 /** Resolve a fresh batch. Only the global settings may choose executable host code. */
 export function resolveHostToolSelections(request: ToolSelectionRequest): ToolSelectionResult[] {
-	if (!request.selections.length) return [];
+	const selectionCount = request.selections.length;
+	if (!selectionCount) return [];
 	try {
 		const codec = codecs ??= createCodecs();
 		const provider = loadProvider(request.agentDir, codec);
@@ -73,12 +74,16 @@ export function resolveHostToolSelections(request: ToolSelectionRequest): ToolSe
 			void results.catch(() => undefined);
 			throw new Error("resolveTools must be synchronous");
 		}
-		if (!Array.isArray(results) || results.length !== request.selections.length) throw new Error("resolveTools must return a synchronous result for each selection, in order");
-		return results.map((result): ToolSelectionResult => {
-			if (!codec.Check(codec.result, result)) return {ok:false, error:"resolveTools returned malformed selectors or an unresolved tool-group alias"};
-			return result.ok ? {ok:true, selectors:[...new Set(result.selectors)]} : result;
+		if (!Array.isArray(results) || results.length !== selectionCount) throw new Error("resolveTools must return a synchronous result for each selection, in order");
+		return Array.from(results, (result): ToolSelectionResult => {
+			const malformed: ToolSelectionResult = {ok:false, error:"resolveTools returned malformed selectors or an unresolved tool-group alias"};
+			if (!codec.Check(codec.result, result)) return malformed;
+			if (!result.ok) return result;
+			// TypeBox accepts sparse array slots. Materialize them before checking selector elements.
+			const selectors = Array.from(result.selectors);
+			return codec.Check(codec.result, {ok:true, selectors}) ? {ok:true, selectors:[...new Set(selectors)]} : malformed;
 		});
 	} catch (error) {
-		return request.selections.map(() => ({ ok: false, error: `Tool selection failed: ${error instanceof Error ? error.message : String(error)}` }));
+		return Array.from({length:selectionCount}, () => ({ ok: false, error: `Tool selection failed: ${error instanceof Error ? error.message : String(error)}` }));
 	}
 }
