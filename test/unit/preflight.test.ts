@@ -89,6 +89,33 @@ describe("public launch contract preflight", () => {
 		} finally { registration.dispose(); }
 	});
 
+	it("captures a provider once for admission and selection, and reports callback failures", async () => {
+		const cwd = path.join(tempDir, "repo");
+		writeAgent(path.join(cwd, ".pi", "agents", "conditional.md"), "---\nname: conditional\ndescription: Conditional fixture\ntools: read\n---\nInspect.\n");
+		const extensionPath = path.join(tempDir, "provider.mjs");
+		fs.writeFileSync(extensionPath, "export default () => {};\n");
+		let captures = 0;
+		let fail = false;
+		const registration = registerRequiredChildExtensions({ sessionId: "preflight-conditional", extensions: () => {
+			captures++;
+			if (fail) throw new Error("Provider catalogue unavailable");
+			return [{ id: "conditional-provider", path: extensionPath, whenTools: ["read"] }];
+		} });
+		try {
+			const input = { agent: "conditional", cwd, parentSessionId: "preflight-conditional" };
+			const result = await resolveSubagentLaunchContract(input);
+			assert.equal(result.ok, true);
+			if (!result.ok) throw new Error(result.message);
+			assert.equal(captures, 1);
+			assert.deepEqual(result.contract.tools.requiredExtensionIds, ["conditional-provider"]);
+			fail = true;
+			const rejected = await resolveSubagentLaunchContract(input);
+			assert.equal(rejected.ok, false);
+			if (rejected.ok) throw new Error("Expected callback rejection");
+			assert.match(rejected.message, /Provider catalogue unavailable/);
+		} finally { registration.dispose(); }
+	});
+
 	it("validates a Claude Code model and level the way the launch does", async () => {
 		const cwd = path.join(tempDir, "cc-repo");
 		fs.mkdirSync(cwd, { recursive: true });

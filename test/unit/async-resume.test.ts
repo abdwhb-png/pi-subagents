@@ -343,6 +343,11 @@ describe("async resume lookup", () => {
 			assert.deepEqual(valid.recoveryDescriptor?.extensionBindings, { "shepherd.dispatch/1": { role: "coder" } });
 			assert.deepEqual(valid.recoveryDescriptor?.requiredExtensions, [{ id: "provider", path: path.join(root, "provider.mjs") }]);
 			assert.ok(Object.isFrozen(valid.recoveryDescriptor?.requiredExtensions));
+			const conditional = [{ id: "provider", path: path.join(root, "provider.mjs"), whenTools: ["fixture_inspect"] }];
+			writeJson(path.join(asyncDir, "recovery-descriptor.json"), { ...descriptor, requiredExtensions: conditional });
+			const retained = resolveAsyncResumeTarget({ id: "run-descriptor" }, { asyncDirRoot: asyncRoot, resultsDir });
+			assert.deepEqual(retained.recoveryDescriptor?.requiredExtensions, conditional);
+			assert.ok(Object.isFrozen(retained.recoveryDescriptor?.requiredExtensions?.[0]?.whenTools));
 			const currentAgent = {
 				name: "worker", description: "Current", systemPrompt: "Current", systemPromptMode: "replace",
 				inheritProjectContext: false, inheritGlobalContext: false, inheritSkills: false,

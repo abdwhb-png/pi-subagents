@@ -2042,6 +2042,34 @@ syncBuiltinESMExports();
 		}
 	});
 
+	for (const async of [false, true]) it(`conditional workflow providers survive admission and disposal (async=${async})`, { skip: !isAsyncAvailable() || !createSubagentExecutor ? "jiti or executor not available" : undefined }, async () => {
+		mockPi.onCall({ output: "provider loaded" });
+		const childCwd = path.join(tempDir, "conditional-child");
+		fs.mkdirSync(childCwd, { recursive: true });
+		const extensionPath = path.join(tempDir, "conditional-provider.mjs");
+		fs.writeFileSync(extensionPath, "export default () => {};\n");
+		const catalogue = [{ id: "conditional-provider", path: extensionPath, whenTools: ["fixture_inspect"] }];
+		const registration = registerRequiredChildExtensions({ sessionId: "session-123", extensions: () => catalogue });
+		const agents = [makeAgent("worker", { tools: ["fixture_inspect"] })];
+		const executor = makeAsyncExecutor(agents, {}, (cwd) => {
+			if (cwd === childCwd) registration.dispose();
+			return { agents };
+		});
+		try {
+			const result = await executor.execute("conditional-workflow", {
+				async,
+				workflowScript: `return runs.run("inspect", { agent: "worker", task: "Inspect", cwd: ${JSON.stringify(childCwd)} });`,
+			}, new AbortController().signal, undefined, makeMinimalCtx(tempDir)) as AsyncExecutionResult;
+			assert.equal(result.isError, undefined, JSON.stringify(result));
+			if (async) {
+				const payload = await readAsyncPayload(result.details!.asyncId!);
+				assert.equal(payload.success, true, JSON.stringify(payload));
+			}
+			assert.deepEqual((await waitForMockPiRuntime(mockPi, 0)).requiredExtensions, catalogue);
+			assert.ok((await waitForMockPiCall(mockPi, 0)).args.includes(extensionPath));
+		} finally { registration.dispose(); }
+	});
+
 	it("background chains inherit the parent session model when no step or agent model is set", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
 		mockPi.onCall({ output: "Done asynchronously" });
 

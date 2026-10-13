@@ -385,9 +385,11 @@ export async function resolveSubagentLaunchContract(input: SubagentLaunchContrac
 	if (resolvedSkills.missing.length > 0) diagnostics.push({ code: "missing_skill", severity: "error", message: `Missing skills: ${resolvedSkills.missing.join(", ")}` });
 
 	const externalRunner = agent.runner?.type === "external-cli" || agent.runner?.type === "external-job";
-	// Machine placement has no preflight input; execution enforces it. Preview the runner-type admission here.
+	// Machine placement has no preflight input; execution enforces it. Capture once for admission and tool planning.
+	let requiredExtensions: PiLaunchToolPlan["requiredExtensions"];
 	try {
-		assertRequiredChildExtensionsAdmitted([resolveRequiredChildExtensions(input.parentSessionId)], { agent: agent.name, runnerType: agent.runner?.type });
+		requiredExtensions = resolveRequiredChildExtensions(input.parentSessionId);
+		assertRequiredChildExtensionsAdmitted([requiredExtensions], { agent: agent.name, runnerType: agent.runner?.type });
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
 		return { ok: false, code: "unsupported_mode", message, diagnostics };
@@ -449,7 +451,7 @@ export async function resolveSubagentLaunchContract(input: SubagentLaunchContrac
 	let toolPlan: PiLaunchToolPlan;
 	const permissionRules = resolvePermissionRules(loadConfig().permissions, agent.permissions);
 	const fast = input.fast ?? agent.fast;
-	const requiredExtensions = externalRunner ? [] : resolveRequiredChildExtensions(input.parentSessionId);
+	if (externalRunner) requiredExtensions = [];
 	try {
 		toolPlan = resolvePiLaunchToolPlan({
 			tools: agent.tools,

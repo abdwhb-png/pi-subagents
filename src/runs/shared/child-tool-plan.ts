@@ -293,9 +293,10 @@ export function resolvePiLaunchToolPlan(
 		input.capabilityCeiling,
 		input.inheritedCapabilityCeiling,
 	);
-	const requiredExtensions = snapshotRequiredChildExtensions(input.requiredExtensions ?? []);
-	if (requiredExtensions.length > 0 && capabilityCeiling?.denyExtensions) {
-		throw new Error(`Capability ceiling from ${capabilityCeiling.sources.join(", ") || "unknown source"} denies extensions but this host requires: ${requiredExtensions.map(({ id }) => id).join(", ")}.`);
+	const catalogue = snapshotRequiredChildExtensions(input.requiredExtensions ?? []);
+	const unconditionalExtensions = catalogue.filter((entry) => entry.whenTools === undefined);
+	if (unconditionalExtensions.length > 0 && capabilityCeiling?.denyExtensions) {
+		throw new Error(`Capability ceiling from ${capabilityCeiling.sources.join(", ") || "unknown source"} denies extensions but this host requires: ${unconditionalExtensions.map(({ id }) => id).join(", ")}.`);
 	}
 	const allowedToolSet =
 		capabilityCeiling?.allowedTools === undefined
@@ -381,6 +382,9 @@ export function resolvePiLaunchToolPlan(
 			...internalTools,
 		]),
 	];
+	const automaticProviders = !capabilityCeiling?.denyExtensions && input.extensions === undefined && input.subagentOnlyExtensions === undefined && toolExtensionPaths.length === 0;
+	const selectedTools = new Set(effectiveToolAllowlist);
+	const requiredExtensions = Object.freeze(catalogue.filter((entry) => entry.whenTools === undefined || (automaticProviders && entry.whenTools.some((tool) => selectedTools.has(tool)))));
 	// Upward contact stays in the --tools allowlist but is not a strict
 	// requirement: children register contact_supervisor at runtime through
 	// the native supervisor channel (or pi-intercom). The pre-0.50 bridge always

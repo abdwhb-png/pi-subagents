@@ -35,7 +35,7 @@ import type { ChildRuntimeConfig } from "./child-runtime-config.ts";
 import { createCapturedChildHooks, withChildSessionErrorReporting } from "./child-hooks.ts";
 import type { ChildTranscriptWriter } from "../../shared/child-transcript.ts";
 import type { ChildSessionLaunch, ChildSessionStorage } from "./child-session.ts";
-import { resolveRequiredChildExtensions, type RequiredChildExtensionSnapshot } from "../../shared/required-child-extensions.ts";
+import { resolveRequiredChildExtensions, snapshotRequiredChildExtensions, type RequiredChildExtensionSnapshot } from "../../shared/required-child-extensions.ts";
 
 /** Environment variable pi-mcp-adapter reads for the tools a child may expose. */
 export const MCP_DIRECT_TOOLS_ENV = "MCP_DIRECT_TOOLS";
@@ -189,7 +189,7 @@ function childStorage(input: BuildInProcessChildLaunchInput): ChildSessionStorag
 }
 
 export function buildInProcessChildLaunch(input: BuildInProcessChildLaunchInput): InProcessChildLaunch {
-	const requiredExtensions = input.requiredExtensions ?? input.inherited?.requiredExtensions ?? resolveRequiredChildExtensions(input.parentSessionId);
+	const requiredExtensions = snapshotRequiredChildExtensions(input.requiredExtensions ?? input.inherited?.requiredExtensions ?? resolveRequiredChildExtensions(input.parentSessionId));
 	const agentCapabilityCeiling: ResolvedSubagentCapabilityCeiling | undefined = input.descendantAllowedAgents === undefined
 		? undefined
 		: { version: 1, allowedAgents: [...input.descendantAllowedAgents], denyExtensions: false, sources: [`agent:${input.childAgentName}`] };
@@ -275,7 +275,7 @@ export function buildInProcessChildLaunch(input: BuildInProcessChildLaunchInput)
 		maxDepth: childDepth.maxDepth,
 		...(toolPlan.capabilityCeiling ? { capabilityCeiling: toolPlan.capabilityCeiling } : {}),
 		...(thinkingCeiling ? { thinkingCeiling } : {}),
-		...(toolPlan.requiredExtensions.length > 0 ? { requiredExtensions: toolPlan.requiredExtensions } : {}),
+		requiredExtensions,
 		inheritProjectContext: input.inheritProjectContext,
 		inheritGlobalContext: input.inheritGlobalContext,
 		inheritSkills: input.inheritSkills,

@@ -74,7 +74,7 @@ import { usageBudgetExceededMessage, usageBudgetState, validateUsageBudgetConfig
 import { assertAgentAllowedByCapabilityCeiling, intersectSubagentCapabilityCeilings, resolveCurrentSubagentCapabilityCeiling, type ResolvedSubagentCapabilityCeiling } from "../shared/capability-ceiling.ts";
 import { isAgentContract } from "../shared/agent-contract.ts";
 import { normalizeExtensionBindings, type ExtensionBindings } from "../shared/extension-bindings.ts";
-import { assertRequiredChildExtensionsAdmitted, hasMandatoryRequiredChildExtensions, readRetainedRequiredChildExtensions, resolveRequiredChildExtensions, type RequiredChildExtensionSnapshot } from "../../shared/required-child-extensions.ts";
+import { assertRequiredChildExtensionsAdmitted, hasRetainedRequiredChildExtensions, readRetainedRequiredChildExtensions, resolveRequiredChildExtensions, type RequiredChildExtensionSnapshot } from "../../shared/required-child-extensions.ts";
 import { capInlineOutput, finalizeSingleOutput, injectSingleOutputInstruction, normalizeSingleOutputOverride, outputPathMappingFromTask, resolveSingleOutputPath, validateFileOnlyOutputMode } from "../shared/single-output.ts";
 import { assertJsonSchemaObject, cleanupStructuredOutputRuntime, createStructuredOutputRuntime } from "../shared/structured-output.ts";
 import { compactForegroundDetails, getSingleResultOutput, PROMPT_REDACTED, readStatus, resolveChildCwd, sumResultsCost, sumResultsUsage, toAgentToolUsage } from "../../shared/utils.ts";
@@ -5468,9 +5468,9 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 			}
 			const acceptanceErrors = validateAcceptanceInput(requestParams.acceptance);
 			if (acceptanceErrors.length > 0) return buildRequestedModeError(requestParams, acceptanceErrors.join(" "));
-			// Capture mandatory host extensions at admission: script children may launch after the host disposes its registration.
+			// Retain host policy and conditional providers at admission; script children can outlive the registration.
 			const admittedRequiredExtensions = retainedRequiredExtensions ?? deps.childRuntime?.requiredExtensions ?? resolveRequiredChildExtensions(ctx.sessionManager.getSessionId() ?? undefined);
-			const workflowRequiredExtensions = hasMandatoryRequiredChildExtensions(admittedRequiredExtensions) ? admittedRequiredExtensions : undefined;
+			const workflowRequiredExtensions = hasRetainedRequiredChildExtensions(admittedRequiredExtensions) ? admittedRequiredExtensions : undefined;
 			const foregroundWorkflowRunId = encodeIndexSegment(_id);
 			if (delegatedWorkflowPermit) {
 				const permitError = validateWorkflowChildPermitRoot(delegatedWorkflowPermit, foregroundWorkflowRunId);
