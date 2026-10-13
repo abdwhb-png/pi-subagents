@@ -3,14 +3,20 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, it } from "node:test";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { discoverAgents, discoverAgentsAll, discoverAgentSnapshot, findBlockingAgentDiagnostic } from "../../src/agents/agents.ts";
+import { registerAgent } from "../../src/api/agents.ts";
+import { clearRuntimeAgentsForPi, mergeRuntimeAgents } from "../../src/agents/runtime-agent-registry.ts";
+import { handleManagementAction } from "../../src/agents/agent-management.ts";
 import { resolveSubagentLaunchContract } from "../../src/api/preflight.ts";
+import { buildInProcessChildLaunch } from "../../src/runs/shared/child-launch.ts";
 
 const originalEnv = { ...process.env };
 let root: string;
 let cwd: string;
 let agentDir: string;
 let provider: string;
+let pi: ExtensionAPI;
 function json<Value>(file: string, value: Value) {
 	fs.mkdirSync(path.dirname(file), { recursive: true });
 	fs.writeFileSync(file, JSON.stringify(value));
@@ -23,6 +29,8 @@ function settings(resolver: string = provider, overrides: Record<string, {tools?
 	json(path.join(agentDir, "settings.json"), { subagents: { toolSelectionResolver: resolver, agentOverrides: overrides } });
 }
 beforeEach(() => {
+	// SAFETY: Registration validates only on/registerTool; discovery uses this object solely as the registry owner.
+	pi = { on() {}, registerTool() {} } as ExtensionAPI;
 	root = fs.mkdtempSync(path.join(os.tmpdir(), "host-tools-"));
 	cwd = path.join(root, "project");
 	agentDir = path.join(root, "agent");
@@ -36,6 +44,7 @@ beforeEach(() => {
 	agent("fixture");
 });
 afterEach(() => {
+	clearRuntimeAgentsForPi(pi);
 	for (const key of Object.keys(process.env)) if (!(key in originalEnv)) delete process.env[key];
 	Object.assign(process.env, originalEnv);
 	fs.rmSync(root, { recursive: true, force: true });
@@ -47,6 +56,115 @@ it("resolves effective selections on cached and uncached discovery without rewri
 		assert.deepEqual(selected?.mcpDirectTools, ["fixture/lookup"]);
 	}
 	assert.deepEqual(discoverAgentsAll(cwd).user.find(a => a.name === "fixture")?.tools, ["@inspect"]);
+});
+
+it("resolves extension-owned runtime tool aliases before building the child launch", () => {
+	fs.writeFileSync(provider, `export function resolveTools({ selections }) { return selections.map(({ selectors }) => ({ ok: true, selectors: selectors.flatMap(s => s === "@inspect" ? ["read", "grep"] : [s]) })); }`);
+	settings(provider, { "runtime-helper": { tools: ["bash"], model: "p/override" } });
+	registerAgent({ pi, name: "runtime-helper", definition: {
+		description: "Runtime fixture", systemPrompt: "Inspect.", tools: ["@inspect"],
+	} });
+	const discovered = discoverAgents(cwd, "both");
+	const merged = mergeRuntimeAgents(pi, discovered, undefined, { cwd, scope: "both" });
+	const selected = merged.agents.find(a => a.name === "runtime-helper");
+	assert.ok(selected);
+	const launch = buildInProcessChildLaunch({
+		cwd, childAgentName: selected.name, childIndex: 0, host: "parent", sessionEnabled: false,
+		inheritProjectContext: false, inheritGlobalContext: false, inheritSkills: false,
+		tools: selected.tools, mcpDirectTools: selected.mcpDirectTools,
+	});
+	assert.deepEqual(launch.session.tools, ["read", "grep"]);
+	assert.equal(selected.model, "p/override");
+	assert.deepEqual(mergeRuntimeAgents(pi, discovered).agents.find(a => a.name === "runtime-helper")?.tools, ["@inspect"]);
+});
+
+it("reports unresolved runtime tool aliases in management lists and model queries", () => {
+	json(path.join(agentDir, "settings.json"), {});
+	registerAgent({ pi, name: "runtime-helper", definition: {
+		description: "Runtime fixture", systemPrompt: "Inspect.", aliases: ["runtime-short"], tools: ["@inspect"],
+	} });
+	const context = { cwd, runtimeAgentOwner: pi, modelRegistry: { getAvailable: () => [] } };
+	for (const action of ["list", "models"]) {
+		const result = handleManagementAction(action, {}, context);
+		const text = result.content.map(part => part.type === "text" ? part.text : "").join("\n");
+		assert.match(text, /runtime-helper/);
+		assert.match(text, /Tool-group aliases require subagents\.toolSelectionResolver/);
+	}
+	const result = handleManagementAction("models", { agent: "runtime-short" }, context);
+	assert.equal(result.isError, true);
+	assert.match(JSON.stringify(result.content), /invalid configuration.*Tool-group aliases require/);
+});
+
+it("splits and deduplicates resolved runtime MCP selectors using the native tool selection rules", () => {
+	registerAgent({ pi, name: "runtime-helper", definition: {
+		description: "Runtime fixture", systemPrompt: "Inspect.", tools: ["read", "@inspect"], mcpDirectTools: ["fixture/other"],
+	} });
+	const merged = mergeRuntimeAgents(pi, discoverAgents(cwd, "both"), undefined, { cwd, scope: "both" });
+	const selected = merged.agents.find(a => a.name === "runtime-helper");
+	assert.deepEqual(selected?.tools, ["read"]);
+	assert.deepEqual(selected?.mcpDirectTools, ["fixture/lookup", "fixture/other"]);
+});
+
+it("refreshes runtime tool groups in the current discovery context without mutating registrations", () => {
+	const data = path.join(root, "group.json");
+	const requestPath = path.join(root, "request.json");
+	json(data, ["read"]);
+	fs.writeFileSync(provider, `import fs from "node:fs"; export function resolveTools(request) {
+		fs.writeFileSync(${JSON.stringify(requestPath)}, JSON.stringify(request));
+		const tools = JSON.parse(fs.readFileSync(${JSON.stringify(data)}, "utf8"));
+		return request.selections.map(({selectors}) => ({ok:true, selectors:selectors.flatMap(s => s === "@inspect" ? tools : [s])}));
+	}`);
+	registerAgent({ pi, name: "runtime-helper", definition: {
+		description: "Runtime fixture", systemPrompt: "Inspect.", tools: ["@inspect"],
+	} });
+	const context = { cwd, scope: "user" as const, projectTrusted: false };
+	const discovered = discoverAgents(cwd, context.scope, undefined, { projectTrusted: false });
+	const first = mergeRuntimeAgents(pi, discovered, undefined, context);
+	json(data, ["grep"]);
+	const next = mergeRuntimeAgents(pi, discovered, undefined, context);
+	assert.deepEqual(first.agents.find(a => a.name === "runtime-helper")?.tools, ["read"]);
+	assert.deepEqual(next.agents.find(a => a.name === "runtime-helper")?.tools, ["grep"]);
+	assert.deepEqual(JSON.parse(fs.readFileSync(requestPath, "utf8")), {
+		cwd, agentDir, scope: "user", projectTrusted: false,
+		selections: [{ agentName: "runtime-helper", selectors: ["@inspect"] }],
+	});
+	assert.deepEqual(mergeRuntimeAgents(pi, discovered).agents.find(a => a.name === "runtime-helper")?.tools, ["@inspect"]);
+});
+
+it("preserves empty and inherited runtime tools even when the provider cannot load", () => {
+	settings(path.join(root, "missing.ts"));
+	for (const [name, tools] of [["runtime-empty", []], ["runtime-inherited", undefined]] as const) {
+		registerAgent({ pi, name, definition: { description: "Runtime fixture", systemPrompt: "Inspect.", tools } });
+	}
+	const merged = mergeRuntimeAgents(pi, discoverAgents(cwd, "both"), undefined, { cwd, scope: "both" });
+	assert.deepEqual(merged.agents.find(a => a.name === "runtime-empty")?.tools, []);
+	const inherited = merged.agents.find(a => a.name === "runtime-inherited");
+	assert.ok(inherited);
+	assert.equal(inherited.tools, undefined);
+});
+
+it("adds runtime failure diagnostics without altering incoming discovery and recovers after configuration repair", () => {
+	json(path.join(agentDir, "settings.json"), {});
+	for (const [name, tools] of [["runtime-helper", ["@inspect"]], ["runtime-concrete", ["read"]]] as const) {
+		registerAgent({ pi, name, definition: { description: "Runtime fixture", systemPrompt: "Inspect.", tools, aliases: [`short-${name}`] } });
+	}
+	const discovered = discoverAgents(cwd, "both");
+	const original = structuredClone(discovered);
+	const context = { cwd, scope: "both" as const };
+	const merged = mergeRuntimeAgents(pi, discovered, undefined, context);
+	assert.equal(merged.agents.some(a => a.name === "runtime-helper"), false);
+	assert.deepEqual(merged.agents.find(a => a.name === "runtime-concrete")?.tools, ["read"]);
+	for (const name of ["runtime-helper", "short-runtime-helper"]) {
+		const diagnostic = findBlockingAgentDiagnostic(name, undefined, merged.agentDiagnostics);
+		assert.equal(diagnostic?.source, "runtime");
+		assert.match(diagnostic?.error ?? "", /Tool-group aliases require/);
+	}
+	assert.deepEqual(merged.agentDiagnostics?.slice(0, original.agentDiagnostics?.length), original.agentDiagnostics);
+	assert.deepEqual(discovered, original);
+	settings();
+	const recovered = mergeRuntimeAgents(pi, discoverAgents(cwd, "both"), undefined, context);
+	assert.deepEqual(recovered.agents.find(a => a.name === "runtime-helper")?.tools, ["read"]);
+	assert.equal(findBlockingAgentDiagnostic("runtime-helper", undefined, recovered.agentDiagnostics), undefined);
 });
 
 it("keeps native empty and inherited selections even if the host cannot resolve tools", () => {

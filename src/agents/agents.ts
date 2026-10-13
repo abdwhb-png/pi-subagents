@@ -2963,7 +2963,7 @@ function discoveryDiagnostics(sources: AgentDiscoverySources, scope: AgentScope)
 	];
 }
 
-function resolveEffectiveToolSelections(agents: AgentConfig[], diagnostics: AgentDiscoveryDiagnostic[], cwd: string, scope: AgentScope, projectTrusted: boolean): AgentConfig[] {
+export function resolveEffectiveToolSelections(agents: AgentConfig[], diagnostics: AgentDiscoveryDiagnostic[], cwd: string, scope: AgentScope, projectTrusted: boolean): AgentConfig[] {
 	const selected = agents.filter(agent => (agent.tools?.length ?? 0) > 0 || (agent.mcpDirectTools?.length ?? 0) > 0);
 	const results = resolveHostToolSelections({
 		cwd, agentDir: getAgentDir(), scope, projectTrusted,

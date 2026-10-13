@@ -6,6 +6,7 @@ import {
 	type AgentConfig,
 	type AgentDiscoveryDiagnostic,
 	type AgentDiscoveryAllResult,
+	type AgentDiscoveryResult,
 	type AgentScope,
 	type AgentSource,
 	defaultInheritProjectContext,
@@ -130,23 +131,22 @@ function parsePackageConfig(value: unknown): { packageName?: string; error?: str
 	return parsePackageName(value, "config.package");
 }
 
-type DiscoveredAgentSets = Pick<AgentDiscoveryAllResult, "builtin" | "package" | "user" | "project" | "cwd">;
+type DiscoveredAgentSets = Pick<AgentDiscoveryAllResult, "builtin" | "package" | "user" | "project" | "cwd" | "agentDiagnostics">;
 
 function allAgents(d: DiscoveredAgentSets): AgentConfig[] {
 	return [...d.builtin, ...d.package, ...d.user, ...d.project];
 }
 
-function effectiveAgentsForScope(
+function effectiveDiscoveryForScope(
 	scope: AgentScope,
 	d: DiscoveredAgentSets,
 	runtimeAgentOwner?: RuntimeAgentOwner,
 	preferredModelProvider?: string,
-): AgentConfig[] {
-	let agents = mergeAgentsForScope(scope, d.user, d.project, d.builtin, d.package);
-	if (runtimeAgentOwner) {
-		agents = mergeRuntimeAgents(runtimeAgentOwner, { agents }, allAgents(d), { cwd: d.cwd, scope, preferredModelProvider }).agents;
-	}
-	return agents;
+): Pick<AgentDiscoveryResult, "agents" | "agentDiagnostics"> {
+	const discovered = { agents: mergeAgentsForScope(scope, d.user, d.project, d.builtin, d.package), agentDiagnostics: d.agentDiagnostics };
+	return runtimeAgentOwner
+		? mergeRuntimeAgents(runtimeAgentOwner, discovered, allAgents(d), { cwd: d.cwd, scope, preferredModelProvider })
+		: discovered;
 }
 
 function availableAgentNamesFromDiscovery(
@@ -154,7 +154,7 @@ function availableAgentNamesFromDiscovery(
 	runtimeAgentOwner?: RuntimeAgentOwner,
 	preferredModelProvider?: string,
 ): string[] {
-	const agents = runtimeAgentOwner ? effectiveAgentsForScope("both", d, runtimeAgentOwner, preferredModelProvider) : allAgents(d);
+	const agents = runtimeAgentOwner ? effectiveDiscoveryForScope("both", d, runtimeAgentOwner, preferredModelProvider).agents : allAgents(d);
 	return [...new Set(agents.map((agent) => agent.name))].sort((a, b) => a.localeCompare(b));
 }
 
@@ -171,7 +171,7 @@ function findAgentsInDiscovery(
 ): AgentConfig[] {
 	const raw = name.trim();
 	const sanitized = sanitizeName(raw);
-	const scoped = effectiveAgentsForScope(scope, d, runtimeAgentOwner, preferredModelProvider);
+	const scoped = effectiveDiscoveryForScope(scope, d, runtimeAgentOwner, preferredModelProvider).agents;
 	let resolved = resolveAgentName(raw, scoped);
 	if (!resolved.agent && !resolved.error && sanitized !== raw) resolved = resolveAgentName(sanitized, scoped);
 	if (resolved.agent) return scoped.filter((agent) => agent.name === resolved.agent!.name).sort((a, b) => a.source.localeCompare(b.source));
@@ -976,8 +976,8 @@ function formatAgentDetail(agent: AgentConfig): string {
 export function handleList(params: ManagementParams, ctx: ManagementContext): AgentToolResult<Details> {
 	const scope = normalizeListScope(params.agentScope) ?? "both";
 	const d = discoverCatalog(ctx, ctx.cwd, ctx.model?.provider);
-	let scopedAgents = effectiveAgentsForScope(scope, d, ctx.runtimeAgentOwner, ctx.model?.provider);
-	scopedAgents = scopedAgents
+	const effective = effectiveDiscoveryForScope(scope, d, ctx.runtimeAgentOwner, ctx.model?.provider);
+	const scopedAgents = effective.agents
 		.sort((a, b) => a.name.localeCompare(b.name));
 	const capabilityCeiling = resolveCurrentSubagentCapabilityCeiling(ctx.currentSessionId);
 	const visibleAgents = scopedAgents.filter((a) => !a.disabled);
@@ -1002,7 +1002,7 @@ export function handleList(params: ManagementParams, ctx: ManagementContext): Ag
 	];
 	appendRestrictedAgentLines({ lines, agents: restrictedAgents, sources: restrictedSources, providerNames: providerNameSet, formatLine });
 	appendExternalJobRegistryLine(lines, [...agents, ...restrictedAgents], providerStatus);
-	appendAgentDiagnosticLines(lines, d.agentDiagnostics);
+	appendAgentDiagnosticLines(lines, effective.agentDiagnostics);
 	if (proactiveSuggestions.length) lines.push("", ...proactiveSuggestions);
 	return result(lines.join("\n"), false, agentCapabilityDetails({
 		capabilityMode,
@@ -1032,7 +1032,8 @@ function handleModels(params: ManagementParams, ctx: ManagementContext): AgentTo
 	if (!scope) return result("agentScope must be 'user', 'project', or 'both' for models.", true);
 
 	const discovered = discoverCatalog(ctx, ctx.cwd, ctx.model?.provider);
-	const effectiveAgents = effectiveAgentsForScope(scope, discovered, ctx.runtimeAgentOwner, ctx.model?.provider)
+	const effective = effectiveDiscoveryForScope(scope, discovered, ctx.runtimeAgentOwner, ctx.model?.provider);
+	const effectiveAgents = effective.agents
 		.sort((a, b) => a.name.localeCompare(b.name));
 	const availableModels = ctx.modelRegistry.getAvailable().map(toModelInfo);
 	const currentModel = ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : undefined;
@@ -1042,7 +1043,7 @@ function handleModels(params: ManagementParams, ctx: ManagementContext): AgentTo
 	let selectedAgents = effectiveAgents;
 	if (requestedAgent) {
 		const matches = findAgentsInDiscovery(requestedAgent, discovered, scope, ctx.runtimeAgentOwner, ctx.model?.provider);
-		const diagnostics = diagnosticsForScope(discovered.agentDiagnostics, scope);
+		const diagnostics = diagnosticsForScope(effective.agentDiagnostics, scope);
 		const normalizedName = sanitizeName(requestedAgent);
 		const diagnostic = findBlockingAgentDiagnostic(requestedAgent, matches, diagnostics)
 			?? (normalizedName !== requestedAgent ? findBlockingAgentDiagnostic(normalizedName, matches, diagnostics) : undefined);
@@ -1119,7 +1120,7 @@ function handleModels(params: ManagementParams, ctx: ManagementContext): AgentTo
 		lines.push("");
 		lines.push("Use an exact provider/id from this list when you pass model; bare ids resolve only when unique in the registry.");
 	}
-	if (!requestedAgent) appendAgentDiagnosticLines(lines, diagnosticsForScope(discovered.agentDiagnostics, scope));
+	if (!requestedAgent) appendAgentDiagnosticLines(lines, diagnosticsForScope(effective.agentDiagnostics, scope));
 	return result(lines.join("\n"));
 }
 

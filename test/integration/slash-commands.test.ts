@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { beforeEach, describe, it } from "node:test";
 import { visibleWidth } from "@earendil-works/pi-tui";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 import { registerAgent } from "../../src/api/agents.ts";
 import { clearRuntimeAgentsForPi } from "../../src/agents/runtime-agent-registry.ts";
@@ -1243,6 +1244,23 @@ describe("slash command custom message delivery", { skip: !available ? "slash-co
 				workflowScript: "return runs.run(\"run\", {\"agent\":\"runtime-helper\",\"task\":\"Inspect\",\"agentScope\":\"both\"})",
 				async: false,
 			});
+		});
+	});
+
+	it("/run blocks unresolved runtime tool aliases by name and agent alias before dispatch", async () => {
+		await withTempProject("pi-slash-runtime-tools-", async (root) => {
+			for (const name of ["runtime-helper", "runtime-short"]) {
+				const run = await captureSlashCommandParams("run", `${name} Inspect`, root, (pi) => {
+					registerAgent({
+						// SAFETY: Registration validates on/registerTool and stores the owner without invoking other SDK methods.
+						pi: pi as ExtensionAPI,
+						name: "runtime-helper",
+						definition: { description: "Runtime helper", systemPrompt: "Inspect.", tools: ["@inspect"], aliases: ["runtime-short"] },
+					});
+				});
+				assert.equal(run.params, undefined);
+				assert.match(run.notifications[0] ?? "", /invalid configuration: Tool-group aliases require subagents\.toolSelectionResolver/);
+			}
 		});
 	});
 
