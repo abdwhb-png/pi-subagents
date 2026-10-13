@@ -7,6 +7,7 @@ import { after, afterEach, before, beforeEach, describe, it } from "node:test";
 import { ASYNC_DIR, INTERCOM_DETACH_REQUEST_EVENT, RESULTS_DIR, SUBAGENT_ASYNC_STARTED_EVENT, SUBAGENT_FOREGROUND_COMPLETE_EVENT } from "../../src/shared/types.ts";
 import { ACTIVE_ASYNC_CAPACITY_DIR, acquireActiveAsyncCapacity, activeAsyncCapacitySessionKey, getActiveAsyncCapacitySnapshot } from "../../src/runs/background/active-async-capacity.ts";
 import { EXTERNAL_JOB_PROVIDER_REGISTRY_KEY, registerExternalJobProvider } from "../../src/api/external-job-provider.ts";
+import { registerRequiredChildExtensions } from "../../src/api/required-child-extensions.ts";
 import { serviceExternalJobBridgeRequests } from "../../src/runs/shared/external-job-bridge.ts";
 import { externalJobFollowUpRequestDigest, externalJobFollowUpRunId, externalJobPromptDigest } from "../../src/runs/shared/external-job-runner.ts";
 import { createWorktreeCleanupPlan } from "../../src/runs/shared/worktree-cleanup-plan.ts";
@@ -797,6 +798,40 @@ describe("intercom result delivery cutover", { skip: !available ? "executor not 
 			assert.equal(result.isError, true);
 			assert.match(result.content[0]?.text ?? "", /Cannot resume:.*achieved status.*acceptance\.review\.required/i);
 			assert.equal(events.emitted.some((entry) => entry.channel === SUBAGENT_ASYNC_STARTED_EVENT), false);
+		}
+	});
+
+	for (const async of [false, true]) it(`resume retains an empty provider catalogue after a host change (async=${async})`, async () => {
+		const { executor } = makeExecutor({ bridgeMode: "off", agents: [makeAgent("worker", { tools: ["read"] })] });
+		const ctx = makeMinimalCtx(tempDir);
+		const cleanup: string[] = [];
+		let registration: ReturnType<typeof registerRequiredChildExtensions> | undefined;
+		try {
+			mockPi.onCall({ output: "Initial work complete" });
+			const first = await executor.execute("empty-catalogue-source", { agent: "worker", task: "Inspect", async, acceptance: false }, new AbortController().signal, undefined, ctx);
+			assert.equal(first.isError, undefined, first.content[0]?.text);
+			const sourceId = async ? first.details?.asyncId : first.details?.runId;
+			assert.ok(sourceId);
+			if (async) {
+				cleanup.push(path.join(ASYNC_DIR, sourceId), path.join(RESULTS_DIR, `${sourceId}.json`));
+				await waitForFile(path.join(RESULTS_DIR, `${sourceId}.json`));
+			}
+			const provider = path.join(tempDir, "late-provider.mjs");
+			fs.writeFileSync(provider, "export default () => {};\n");
+			registration = registerRequiredChildExtensions({ sessionId: ctx.sessionManager.getSessionId(), extensions: [{ id: "late", path: provider, whenTools: ["read"] }] });
+			mockPi.onCall({ output: "Continuation complete" });
+			const resumed = await executor.execute("empty-catalogue-resume", { action: "resume", id: sourceId, message: "Continue", acceptance: false }, new AbortController().signal, undefined, ctx);
+			assert.equal(resumed.isError, undefined, resumed.content[0]?.text);
+			const resumedId = resumed.details?.asyncId;
+			assert.ok(resumedId);
+			const resultPath = path.join(RESULTS_DIR, `${resumedId}.json`);
+			cleanup.push(path.join(ASYNC_DIR, resumedId), resultPath);
+			await waitForFile(resultPath);
+			assert.equal(JSON.parse(fs.readFileSync(resultPath, "utf8")).success, true);
+			assert.equal((await readMockCallArgs(1)).includes(provider), false, "Resume must not load a provider absent from the original catalogue");
+		} finally {
+			registration?.dispose();
+			for (const entry of cleanup) fs.rmSync(entry, { recursive: true, force: true });
 		}
 	});
 

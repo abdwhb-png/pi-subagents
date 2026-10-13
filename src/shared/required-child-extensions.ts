@@ -118,16 +118,10 @@ export function assertRequiredChildExtensionsAdmitted(snapshots: ReadonlyArray<R
 	if (route) throw new Error(`Agent '${launch.agent}' cannot run on ${route}: the host requires child extensions (${ids.join(", ")}) for every runner, and only local native Pi children load them.`);
 }
 
-/** Conditional catalogues must survive workflow append even when the admitted step uses none of their tools. */
-export function hasRetainedRequiredChildExtensions(snapshot: RequiredChildExtensionSnapshot | undefined): snapshot is RequiredChildExtensionSnapshot {
-	return snapshot?.some((entry) => entry.requireForAllRunners || entry.whenTools !== undefined) === true;
-}
-
 const RETAINED_FILE = "required-child-extensions.json";
 
-/** Persist the admission policy and conditional providers for subsequent workflow steps. */
+/** An empty admission catalogue is authoritative too; only missing legacy files allow recapture. */
 export function writeRetainedRequiredChildExtensions(asyncDir: string, snapshot: RequiredChildExtensionSnapshot): void {
-	if (!hasRetainedRequiredChildExtensions(snapshot)) return;
 	fs.writeFileSync(path.join(asyncDir, RETAINED_FILE), `${JSON.stringify(snapshot)}\n`, { mode: 0o600 });
 }
 

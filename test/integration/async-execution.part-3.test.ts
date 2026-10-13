@@ -2070,6 +2070,57 @@ syncBuiltinESMExports();
 		} finally { registration.dispose(); }
 	});
 
+	it("append-step retains an empty catalogue after the host gains a provider", { skip: !createSubagentExecutor ? "executor not available" : undefined }, async () => {
+		const runId = `append-empty-${Date.now().toString(36)}`;
+		const asyncDir = path.join(ASYNC_DIR, runId);
+		const budget = createRunFanoutBudget(runId, 8);
+		const provider = path.join(tempDir, "append-late-provider.mjs");
+		fs.writeFileSync(provider, "export default () => {};\n");
+		const registration = registerRequiredChildExtensions({ sessionId: "session-123", extensions: [{ id: "late", path: provider, whenTools: ["read"] }] });
+		try {
+			fs.mkdirSync(asyncDir, { recursive: true });
+			fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify({
+				runId, sessionId: "session-123", mode: "chain", state: "running", startedAt: 100, lastUpdate: 200, cwd: tempDir, chainStepCount: 1,
+				steps: [{ agent: "worker", status: "running" }],
+			}));
+			writeRunFanoutBudgetDescriptor(asyncDir, budget);
+			writeRetainedRequiredChildExtensions(asyncDir, []);
+			const executor = makeAsyncExecutor([makeAgent("worker", { tools: ["read"] })]);
+			const result = await executor.execute("append-empty", { action: "append-step", id: runId, step: { agent: "worker", task: "Inspect" } }, new AbortController().signal, undefined, makeMinimalCtx(tempDir));
+			assert.equal(result.isError, undefined, result.content[0]?.text);
+			assert.deepEqual(readPendingChainAppendRequests(asyncDir)[0]?.steps[0]?.requiredExtensions, []);
+		} finally {
+			registration.dispose();
+			fs.rmSync(asyncDir, { recursive: true, force: true });
+			fs.rmSync(budget.directory, { recursive: true, force: true });
+		}
+	});
+
+	for (const async of [false, true]) it(`workflow children retain an empty admission catalogue (async=${async})`, { skip: !isAsyncAvailable() || !createSubagentExecutor ? "jiti or executor not available" : undefined }, async () => {
+		mockPi.onCall({ output: "done" });
+		const provider = path.join(tempDir, "late-provider.mjs");
+		fs.writeFileSync(provider, "export default () => {};\n");
+		let captures = 0;
+		const registration = registerRequiredChildExtensions({
+			sessionId: "session-123",
+			extensions: () => ++captures === 1 ? [] : [{ id: "late", path: provider, whenTools: ["read"] }],
+		});
+		try {
+			const executor = makeAsyncExecutor([makeAgent("worker", { tools: ["read"] })]);
+			const result = await executor.execute("empty-catalogue-workflow", {
+				async,
+				workflowScript: 'return runs.run("inspect", { agent: "worker", task: "Inspect" });',
+			}, new AbortController().signal, undefined, makeMinimalCtx(tempDir));
+			assert.equal(result.isError, undefined, JSON.stringify(result));
+			if (async) {
+				assert.ok(result.details?.asyncId);
+				assert.equal((await readAsyncPayload(result.details.asyncId)).success, true);
+			}
+			assert.deepEqual((await waitForMockPiRuntime(mockPi, 0)).requiredExtensions, []);
+			assert.equal((await waitForMockPiCall(mockPi, 0)).args.includes(provider), false);
+		} finally { registration.dispose(); }
+	});
+
 	it("background chains inherit the parent session model when no step or agent model is set", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
 		mockPi.onCall({ output: "Done asynchronously" });
 

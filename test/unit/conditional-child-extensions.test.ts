@@ -104,3 +104,14 @@ it("persists a conditional catalogue for workflow append without requiring exter
 		assertRequiredChildExtensionsAdmitted([catalogue], { agent: "worker", machine: "remote" });
 	} finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
+
+it("distinguishes a retained empty catalogue from a missing legacy snapshot", () => {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-empty-provider-retention-"));
+	try {
+		assert.equal(readRetainedRequiredChildExtensions(dir), undefined);
+		writeRetainedRequiredChildExtensions(dir, []);
+		const retained = readRetainedRequiredChildExtensions(dir);
+		assert.deepEqual(retained, []);
+		assert.ok(Object.isFrozen(retained));
+	} finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});

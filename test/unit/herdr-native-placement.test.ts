@@ -15,6 +15,7 @@ import { HerdrPiFrameDecoder, encodeHerdrPiFrame, HERDR_PI_MAX_FRAME_BYTES, HERD
 import { parseHerdrEndpoint } from "../../src/runs/shared/herdr-connection.ts";
 import { formatHerdrMachineRunnerUnsupported, resolveHerdrMachinePlacement } from "../../src/runs/shared/herdr-machine.ts";
 import { buildRunnerChildLaunch } from "../../src/runs/background/runner-child-launch.ts";
+import { buildInProcessChildLaunch } from "../../src/runs/shared/child-launch.ts";
 import { runChildSession } from "../../src/runs/background/run-child-session.ts";
 import { getAgentDir } from "../../src/shared/utils.ts";
 import registerHerdrPiBridge, { resolveRemoteHerdrResources } from "../../src/extension/herdr-pi-bridge.ts";
@@ -62,6 +63,31 @@ describe("pane-native Herdr placement public contracts", { skip: process.platfor
 	});
 
 	it("rejects unrepresented required and MCP tool contracts at the public factory boundary before provisioning", async () => { let provisioned = 0; const factory = createPlacementAwareChildSessionFactory({ async create() { return child; }, async dispose() {} }, async () => { provisioned++; return child; }); await assert.rejects(factory.create({ ...launch(true), runtime: { ...runtime, requiredTools: ["required_missing"] } }), /required-tool/u); await assert.rejects(factory.create({ ...launch(true), runtime: { ...runtime, mcpDirectTools: ["mcp_tool"] } }), /MCP direct tools/u); assert.equal(provisioned, 0); });
+
+	for (const whenTools of [undefined, ["fixture_inspect"]]) it(`routes remote launches with ${whenTools ? "unused" : "empty"} provider catalogues`, async () => {
+		const requiredExtensions = whenTools ? [{ id: "unused", path: path.join(os.tmpdir(), "unused-provider.mjs"), whenTools }] : [];
+		const built = buildInProcessChildLaunch({
+			cwd: machine.cwd, machine, host: "parent", sessionEnabled: false,
+			childAgentName: "worker", childIndex: 0,
+			inheritProjectContext: false, inheritGlobalContext: false, inheritSkills: false,
+			requiredExtensions,
+		});
+		let provisioned = 0;
+		const factory = createPlacementAwareChildSessionFactory({ async create() { throw new Error("Unexpected local launch"); }, async dispose() {} }, async () => { provisioned++; return child; });
+		try {
+			await factory.create(built.session);
+			assert.equal(provisioned, 1);
+		} finally { await factory.dispose(); }
+	});
+
+	it("rejects required runtime providers even when the selected remote extension list is empty", () => {
+		for (const entry of [
+			{ id: "required", path: path.join(os.tmpdir(), "required-provider.mjs") },
+			{ id: "policy", path: path.join(os.tmpdir(), "policy-provider.mjs"), whenTools: ["fixture_inspect"], requireForAllRunners: true as const },
+		]) {
+			assert.throws(() => serializeHerdrPiLaunch({ ...launch(true), runtime: { ...runtime, requiredExtensions: [entry] } }), /required-tool\/extension contracts/);
+		}
+	});
 
 	it("propagates resolved placement into the detached native child launch", () => {
 		const built = buildRunnerChildLaunch({ agent: "worker", task: "inspect", machine, cwd: machine.cwd, tools: ["read"], inheritProjectContext: true, inheritGlobalContext: true, inheritSkills: false }, { cwd: "/local/repo", id: "run-route", flatIndex: 0 }, { sessionEnabled: true, watchdogStatus() {} });

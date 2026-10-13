@@ -2130,7 +2130,7 @@ export function executeAsyncSingle(
 		...(lane ? { lane } : {}),
 		launchContractDigest,
 		...(extensionBindings ? { extensionBindings } : {}),
-		...(requiredExtensions.length > 0 ? { requiredExtensions } : {}),
+		requiredExtensions,
 		runFanoutBudget,
 		sourceRunId: id,
 		...(params.agentContract ? { agentContract: params.agentContract } : {}),
