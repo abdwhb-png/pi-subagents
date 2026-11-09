@@ -30,16 +30,21 @@ export const HOST_PEER_ALIASES: ReadonlyArray<{ specifier: string; pkg: string; 
 	{ specifier: "typebox/value", pkg: "typebox", subpath: "./value" },
 ];
 
-/** Public Pi manifests introduce chord in 0.85.0 (absent through 0.84.4). */
-const CHORD_PEER_ALIASES = [
+/** Pi manifests declare chord from 0.85.0 through 1.1.x; earlier hosts and 1.2.0+ do not ship it. */
+const CHORD_PACKAGE = "@earendil-works/chord";
+const CHORD_PEER_ALIASES: typeof HOST_PEER_ALIASES = [
 	{ specifier: "@earendil-works/chord", pkg: "@earendil-works/chord", subpath: "." },
 	{ specifier: "@earendil-works/chord/context", pkg: "@earendil-works/chord", subpath: "./context" },
 ];
+
+const SCHEMA_PACKAGE = "@earendil-works/pi-schema";
 
 interface PackageManifest {
 	name?: unknown;
 	version?: unknown;
 	main?: unknown;
+	dependencies?: unknown;
+	optionalDependencies?: unknown;
 	exports?: unknown;
 }
 
@@ -132,24 +137,40 @@ function findPeerPackageDir(piPackageRoot: string, pkg: string, hostName: unknow
 	return candidates.find((candidate) => readManifest(candidate)?.name === pkg);
 }
 
+function declaresDependency(manifest: PackageManifest, pkg: string): boolean {
+	return [manifest.dependencies, manifest.optionalDependencies].some((deps) => !!deps && typeof deps === "object" && Object.hasOwn(deps, pkg));
+}
+
 /** The alias map the runner needs, or the specifiers that could not be resolved. */
 export function resolveHostPeerAliases(piPackageRoot: string): { aliases: Record<string, string>; missing: string[] } {
 	const aliases: Record<string, string> = {};
 	const missing: string[] = [];
 	const hostManifest = readManifest(piPackageRoot);
-	// Only known stable pre-chord versions may omit it. Unknown/prerelease
-	// hosts retain the required aliases, rather than hiding a broken install.
-	const stableVersion = typeof hostManifest?.version === "string" ? /^0\.(\d+)\.\d+$/.exec(hostManifest.version) : null;
-	const isPreChord = stableVersion !== null && Number(stableVersion[1]) < 85;
-	const required: ReadonlyArray<(typeof HOST_PEER_ALIASES)[number]> = [...HOST_PEER_ALIASES, ...(isPreChord ? [] : CHORD_PEER_ALIASES)];
-	for (const { specifier, pkg, subpath, optional } of required) {
+	// Chord is aliased whenever the host provides it, but required only when the host
+	// manifest declares it (Pi 0.85 through 1.1), so a declared-but-missing chord still
+	// fails closed. An unreadable host manifest keeps it required rather than hiding a broken install.
+	const chordRequired = !hostManifest || declaresDependency(hostManifest, CHORD_PACKAGE);
+	for (const { specifier, pkg, subpath, optional } of [...HOST_PEER_ALIASES, ...CHORD_PEER_ALIASES]) {
 		const packageDir = findPeerPackageDir(piPackageRoot, pkg, hostManifest?.name);
 		const target = packageDir ? resolvePackageSubpath(packageDir, subpath) : undefined;
 		// An optional subpath the package does not declare is unreachable, so skip it; a declared but missing file still fails.
 		if (optional && packageDir && target === undefined) continue;
 		// Native loaders short-circuit resolution, so aliases must retain the real package's dependency scope.
 		if (target && fs.existsSync(target)) aliases[specifier] = fs.realpathSync(target);
-		else missing.push(specifier);
+		else if (pkg !== CHORD_PACKAGE || chordRequired) missing.push(specifier);
+	}
+	// Pi 1.5+ pi-ai imports pi-schema; without it a child dies after its launch was accepted. pi-ai's
+	// own import already reaches the right copy, so this is only a presence check, never an alias:
+	// an alias would also redirect extensions that ship their own copy.
+	const piAiDir = findPeerPackageDir(piPackageRoot, "@earendil-works/pi-ai", hostManifest?.name);
+	const piAiManifest = piAiDir ? readManifest(piAiDir) : undefined;
+	if (piAiDir && piAiManifest && declaresDependency(piAiManifest, SCHEMA_PACKAGE)) {
+		// Resolve from pi-ai's real path, as Node does, so nested, hoisted and pnpm-sibling copies count.
+		const schemaDir = findPeerPackageDir(fs.realpathSync(piAiDir), SCHEMA_PACKAGE, undefined);
+		for (const subpath of [".", "./formats"]) {
+			const target = schemaDir ? resolvePackageSubpath(schemaDir, subpath) : undefined;
+			if (!target || !fs.existsSync(target)) missing.push(subpath === "." ? SCHEMA_PACKAGE : `${SCHEMA_PACKAGE}/formats`);
+		}
 	}
 	return { aliases, missing };
 }

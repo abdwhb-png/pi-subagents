@@ -10,11 +10,13 @@ import type { JsonSchemaObject } from "../../shared/types.ts";
 import type { ResolvedAcceptanceReportMode } from "./acceptance.ts";
 
 export const MISSING_STRUCTURED_OUTPUT_CALL_ERROR = "Missing structured_output call; this step has outputSchema and must finish by calling structured_output.";
+export const STRUCTURED_OUTPUT_FOLLOW_UP = "You ended without calling `structured_output`. Call it now with your result. Do not repeat the work.";
 export const MISSING_STRUCTURED_ACCEPTANCE_REPORT_ERROR = "Missing acceptanceReport in structured_output call; acceptance.report is \"on\".";
 export const STRUCTURED_OUTPUT_REJECTION_ERROR = "structured_output was invoked but no valid output was captured.";
 export const INVALID_STRUCTURED_OUTPUT_SCHEMA_ERROR = "Structured output invocation was rejected: invalid outputSchema.";
 export const STRUCTURED_OUTPUT_VALIDATOR_UNAVAILABLE_ERROR = "Structured output invocation was rejected: validator unavailable.";
 export const MAX_STRUCTURED_OUTPUT_REJECTION_ERROR_BYTES = 4096;
+const MAX_LISTED_ALLOWED_VALUES = 20;
 
 function utf8Prefix(value: string, maxBytes: number): string {
 	if (Buffer.byteLength(value, "utf8") <= maxBytes) return value;
@@ -152,13 +154,16 @@ interface JsonSchemaValidationError {
 	keyword?: string;
 	schemaPath?: string;
 	instancePath?: string;
-	params?: { failingKeyword?: string; requiredProperties?: string[] };
+	params?: { failingKeyword?: string; requiredProperties?: string[]; allowedValues?: unknown[]; allowedValue?: unknown };
 	message?: string;
 }
 
 type CompileJsonSchema = (schema: unknown) => CompiledJsonSchema;
 
 let cachedCompile: Promise<CompileJsonSchema> | undefined;
+// prepareArguments is synchronous, so it can only use a compiler that has already loaded.
+let loadedCompile: CompileJsonSchema | undefined;
+let compileLoadError: unknown;
 
 export async function resolveCompileFromPackageRoot(packageRoot: string): Promise<CompileJsonSchema | undefined> {
 	const requireFromRoot = createRequire(path.join(packageRoot, "package.json"));
@@ -199,12 +204,21 @@ async function importCompile(): Promise<CompileJsonSchema> {
 
 function loadCompile(): Promise<CompileJsonSchema> {
 	if (!cachedCompile) {
-		cachedCompile = importCompile().catch((error) => {
+		cachedCompile = importCompile().then((compile) => {
+			loadedCompile = compile;
+			return compile;
+		}, (error) => {
 			cachedCompile = undefined;
+			compileLoadError = error;
 			throw error;
 		});
 	}
 	return cachedCompile;
+}
+
+/** Resolves once the validator has loaded or failed; a failure is reported by the structured_output call. */
+export function structuredOutputValidatorReady(): Promise<void> {
+	return loadCompile().then(() => undefined, () => undefined);
 }
 
 function jsonPointerTarget(root: unknown, pointer: string): unknown {
@@ -325,6 +339,14 @@ function formatValidationError(error: JsonSchemaValidationError): string[] {
 	if (error.keyword === "required" && error.params?.requiredProperties?.length) {
 		return error.params.requiredProperties.map((property) => `${pathText === "root" ? property : `${pathText}.${property}`}: is required`);
 	}
+	if (error.keyword === "enum" && error.params?.allowedValues?.length) {
+		const values = error.params.allowedValues;
+		const extra = values.length - MAX_LISTED_ALLOWED_VALUES;
+		return [`${pathText}: must be one of ${values.slice(0, MAX_LISTED_ALLOWED_VALUES).map((value) => JSON.stringify(value)).join(", ")}${extra > 0 ? `, and ${extra} more` : ""}`];
+	}
+	if (error.keyword === "const" && error.params && "allowedValue" in error.params) {
+		return [`${pathText}: must be ${JSON.stringify(error.params.allowedValue)}`];
+	}
 	return [`${pathText}: ${error.message}`];
 }
 
@@ -368,15 +390,37 @@ export function createStructuredOutputRuntime(schema: JsonSchemaObject, baseDir?
 }
 
 export async function validateStructuredOutputValue(schema: JsonSchemaObject, value: unknown): Promise<{ status: "valid" } | { status: "invalid"; message: string }> {
-	const compile = await loadCompile();
+	return validateWithCompile(await loadCompile(), schema, value);
+}
+
+/**
+ * The tool's `prepareArguments` hook: checks the raw `value` before Pi converts tool arguments
+ * (Pi can turn `"x"` into `["x"]` or `null` into `"null"`), so only a value that already matches
+ * the schema is captured. Fails closed when the validator has not loaded.
+ */
+export function prepareStructuredOutputArguments(schema: JsonSchemaObject, args: unknown): unknown {
+	if (!args || typeof args !== "object" || !("value" in args)) return args;
+	if (!loadedCompile) throw compileLoadError ?? new Error("Structured output validator is still loading; call structured_output again.");
+	const validation = validateWithCompile(loadedCompile, schema, args.value);
+	if (validation.status === "invalid") throw new Error(`Structured output validation failed: ${validation.message}`);
+	return args;
+}
+
+function validateWithCompile(compile: CompileJsonSchema, schema: JsonSchemaObject, value: unknown): { status: "valid" } | { status: "invalid"; message: string } {
 	let validator: CompiledJsonSchema;
 	try {
 		validator = compile(schema);
 	} catch (error) {
 		return { status: "invalid", message: `invalid outputSchema: ${error instanceof Error ? error.message : String(error)}` };
 	}
-	if (validator.Check(value)) return { status: "valid" };
-	const originalErrors = [...validator.Errors(value)];
+	let originalErrors: JsonSchemaValidationError[];
+	try {
+		if (validator.Check(value)) return { status: "valid" };
+		originalErrors = [...validator.Errors(value)];
+	} catch (error) {
+		// A recursive $ref compiles but overflows the stack when checked.
+		return { status: "invalid", message: `outputSchema cannot be validated (cyclic or too deep): ${error instanceof Error ? error.message : String(error)}` };
+	}
 	const errors: string[] = [];
 	const uniqueErrors = new Set<string>();
 	const seen = new Set<string>();

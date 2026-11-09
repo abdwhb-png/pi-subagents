@@ -2,13 +2,18 @@ import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
-import type { AgentBeforeSettleEvent, AgentBeforeSettleEventResult, ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import type { AgentBeforeSettleEvent, AgentBeforeSettleEventResult, ExtensionAPI, MessageStartEvent, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import type { ChildSupervisorMetadata } from "../runs/shared/child-runtime-config.ts";
-import { INTERCOM_DETACH_REQUEST_EVENT, POLL_INTERVAL_MS, TEMP_ROOT_DIR, type ControlEvent, type IntercomEventBus, type SubagentState } from "../shared/types.ts";
-import { writeAtomicJson } from "../shared/atomic-json.ts";
+import type { ParentWake } from "../shared/parent-wake.ts";
+import { ASYNC_DIR, INTERCOM_DETACH_REQUEST_EVENT, POLL_INTERVAL_MS, TEMP_ROOT_DIR, type ControlEvent, type IntercomEventBus, type SubagentState } from "../shared/types.ts";
+import { readStatus } from "../shared/utils.ts";
+import { inheritedSessionIds } from "../shared/session-succession.ts";
+import { ownsRun } from "../runs/shared/run-ownership.ts";
+import { writeAtomicJson, writePrivateAtomicJson } from "../shared/atomic-json.ts";
 import { shouldUseNativeFsWatch } from "../shared/watch-strategy.ts";
 import { MODEL_ONLY_TOOL } from "../shared/extension-context.ts";
+import { reportSessionWarning } from "../shared/session-warnings.ts";
 import {
 	SUPERVISOR_REQUEST_MESSAGE_TYPE,
 	SUPERVISOR_REPLY_ENTRY_TYPE,
@@ -61,11 +66,23 @@ interface SupervisorRequestCorrelation {
 	updatedAt: number;
 }
 
+interface EndedSupervisorRequest {
+	request: PendingSupervisorRequest;
+	// "deadline": the request file went missing after the ask deadline, so the ask expired or the run stopped then.
+	lifecycle: Exclude<SupervisorRequestLifecycle, "pending" | "wrong-session"> | "deadline";
+	/** When the parent noticed the ending; also the pruning clock. */
+	endedAt: number;
+	/** When the ending happened, when the parent knows it. */
+	eventAt?: number;
+}
+
 interface SupervisorReply {
 	type: "subagent.supervisor.reply";
 	requestId: string;
 	createdAt: number;
 	message: string;
+	/** Transport failure, never a supervisor decision or approval. */
+	error?: string;
 }
 
 interface ContactSupervisorParams {
@@ -88,7 +105,7 @@ interface NativeSupervisorChannelDeps {
 	getChannelDirs?: () => { dirs: string[]; retire?: () => void };
 	/** Retained scheduled states for the current runtime owner, never foreign owners. */
 	getCurrentOwnerStates?: () => Iterable<SubagentState>;
-	parentWake?: Pick<ExtensionAPI, "sendMessage">;
+	parentWake?: Pick<ParentWake, "sendMessage">;
 	platform?: NodeJS.Platform;
 	watch?: SupervisorWatch;
 	timers?: Pick<typeof globalThis, "setInterval" | "clearInterval" | "setImmediate" | "clearImmediate">;
@@ -172,17 +189,31 @@ function delay(ms: number, signal?: AbortSignal): Promise<void> {
 	});
 }
 
-async function waitForReply(channelDir: string, requestId: string, deadline: number, signal?: AbortSignal): Promise<SupervisorReply> {
+/** The owning parent moves `expiresAt` forward while Pi still holds the request's notice back from its model. */
+function extendedDeadline(requestFile: string, deadline: number): number {
+	try {
+		const expiresAt = (JSON.parse(fs.readFileSync(requestFile, "utf-8")) as { expiresAt?: unknown }).expiresAt;
+		return typeof expiresAt === "number" && Number.isFinite(expiresAt) ? Math.max(deadline, expiresAt) : deadline;
+	} catch {
+		return deadline;
+	}
+}
+
+async function waitForReply(channelDir: string, requestId: string, initialDeadline: number, signal?: AbortSignal): Promise<SupervisorReply> {
 	const file = replyPath(channelDir, requestId);
+	const request = requestPath(channelDir, requestId);
+	let deadline = initialDeadline;
 	while (Date.now() <= deadline) {
 		if (signal?.aborted) throw new Error("Supervisor request cancelled.");
 		if (fs.existsSync(file)) {
 			const parsed = JSON.parse(fs.readFileSync(file, "utf-8")) as Partial<SupervisorReply>;
 			if (parsed.type === "subagent.supervisor.reply" && parsed.requestId === requestId && typeof parsed.message === "string") {
+				if (typeof parsed.error === "string") throw new Error(parsed.error);
 				return parsed as SupervisorReply;
 			}
 		}
 		await delay(250, signal);
+		deadline = extendedDeadline(request, deadline);
 	}
 	throw new Error("Timed out waiting for supervisor reply.");
 }
@@ -254,17 +285,40 @@ function hasTool(pi: ExtensionAPI, name: string): boolean {
 }
 
 /**
+ * What the model sees of `contact_supervisor`, shared by a child's working tool and the
+ * top-level session's refusing one: a forked child's tool list then equals its parent's, so its
+ * first request can reuse the parent's prompt cache.
+ */
+export const CONTACT_SUPERVISOR_TOOL_NAME = "contact_supervisor";
+
+const CONTACT_SUPERVISOR_DECLARATION = {
+	name: CONTACT_SUPERVISOR_TOOL_NAME,
+	...MODEL_ONLY_TOOL,
+	label: "Contact Supervisor",
+	description: "Contact the parent/supervisor session for a blocking decision, structured interview, or progress update.",
+	parameters: ContactSupervisorParamsSchema,
+};
+
+export const TOP_LEVEL_SUPERVISOR_REFUSAL = "contact_supervisor works only inside a subagent; this session has no supervisor.";
+
+/** `contact_supervisor` for a session that is not a subagent: every call is an error. */
+export function topLevelSupervisorTool(): ToolDefinition<typeof ContactSupervisorParamsSchema, Record<string, unknown>> {
+	return {
+		...CONTACT_SUPERVISOR_DECLARATION,
+		async execute() {
+			return { isError: true, content: [{ type: "text", text: TOP_LEVEL_SUPERVISOR_REFUSAL }], details: {} };
+		},
+	};
+}
+
+/**
  * Register the child-side `contact_supervisor` tool. The host passes the
  * channel metadata in the child runtime config.
  */
 export function registerNativeSupervisorClient(pi: ExtensionAPI, metadata: ChildSupervisorMetadata | undefined): void {
-	if (!metadata || hasTool(pi, "contact_supervisor")) return;
+	if (!metadata || hasTool(pi, CONTACT_SUPERVISOR_TOOL_NAME)) return;
 	const tool: ToolDefinition<typeof ContactSupervisorParamsSchema, Record<string, unknown>> = {
-		name: "contact_supervisor",
-		...MODEL_ONLY_TOOL,
-		label: "Contact Supervisor",
-		description: "Contact the parent/supervisor session for a blocking decision, structured interview, or progress update.",
-		parameters: ContactSupervisorParamsSchema,
+		...CONTACT_SUPERVISOR_DECLARATION,
 		execute(id, params, signal) {
 			return sendSupervisorRequest(params as ContactSupervisorParams, metadata, signal, id);
 		},
@@ -393,9 +447,19 @@ function cleanupStaleEmptySupervisorChannels(nowMs = Date.now(), platform: NodeJ
 	return removed;
 }
 
-function requestMatchesOwner(request: SupervisorRequest, state: Pick<SubagentState, "supervisorOwnerSessionId">): boolean {
+function requestMatchesOwner(request: SupervisorRequest, state: Pick<SubagentState, "supervisorOwnerSessionId" | "currentSessionId">): boolean {
 	const currentSessionId = state.supervisorOwnerSessionId;
-	return Boolean(currentSessionId && request.orchestratorSessionId === currentSessionId);
+	if (currentSessionId && request.orchestratorSessionId === currentSessionId) return true;
+	// orchestratorSessionId is Pi's runtime session id, while inherited sessions are known by session file,
+	// so an inherited run's ask is matched through the run's recorded owner. This runs inside the poll's
+	// timers and watchers, where a throw exits Pi, so an unreadable status counts as not owned.
+	if (!state.currentSessionId || inheritedSessionIds(state.currentSessionId).length === 0) return false;
+	if (!request.runId || request.runId.startsWith(".") || path.basename(request.runId) !== request.runId) return false;
+	try {
+		return ownsRun(state.currentSessionId, readStatus(path.join(ASYNC_DIR, request.runId))?.sessionId);
+	} catch {
+		return false;
+	}
 }
 
 function rememberedForegroundChild(request: SupervisorRequest, state: SubagentState) {
@@ -444,7 +508,7 @@ function removeRequestFile(file: string): void {
 }
 
 type SupervisorRequestLifecycle = "pending" | "resolved" | "expired" | "inactive" | "missing" | "wrong-session";
-type SupervisorRequestLifecycleObserver = (request: PendingSupervisorRequest, lifecycle: SupervisorRequestLifecycle) => void;
+type SupervisorRequestLifecycleObserver = (request: PendingSupervisorRequest, lifecycle: SupervisorRequestLifecycle, eventAt?: number) => void;
 
 function requestExpiresAt(request: SupervisorRequest, now: number): number {
 	const expiresAt = (request as { expiresAt?: unknown }).expiresAt;
@@ -488,9 +552,13 @@ function refreshPendingRequests(pending: Map<string, PendingSupervisorRequest>, 
 	}
 }
 
+function pendingHeader(request: PendingSupervisorRequest): string {
+	return `- ${request.id}: ${request.agent} [${request.runId}#${request.childIndex}] ${request.reason}.`;
+}
+
 function formatPendingLine(request: PendingSupervisorRequest): string {
 	const replyHint = request.expectsReply ? ` Reply: ${supervisorReplyHint(request.id)}` : "";
-	const header = `- ${request.id}: ${request.agent} [${request.runId}#${request.childIndex}] ${request.reason}.${replyHint}`;
+	const header = `${pendingHeader(request)}${replyHint}`;
 	// The request notice can be missed; pending is the parent's only way to read the question again.
 	return request.message ? `${header}\n  ${request.message.replace(/\n/g, "\n  ")}` : header;
 }
@@ -551,13 +619,36 @@ function appendSupervisorReplyEntry(pi: ExtensionAPI, request: PendingSupervisor
 	}
 }
 
-function resolvePendingRequest(pending: Map<string, PendingSupervisorRequest>, params: IntercomParams): PendingSupervisorRequest {
+function endedRequestText(ended: EndedSupervisorRequest, runState: SubagentState): string {
+	const { request } = ended;
+	const iso = (time: number) => new Date(time).toISOString();
+	const when = ended.eventAt !== undefined ? ` at ${iso(ended.eventAt)}` : ` (noticed at ${iso(ended.endedAt)})`;
+	const subject = `Supervisor request '${request.id}' from ${request.agent} [${request.runId}#${request.childIndex}]`;
+	const runStatus = runState.asyncJobs.get(request.runId)?.status;
+	const runNow = runStatus && runStatus !== "queued" && runStatus !== "running" ? ` Run ${request.runId} is now ${runStatus}.` : "";
+	switch (ended.lifecycle) {
+		case "resolved": return `${subject} was already answered${when}.`;
+		case "expired": return `${subject} expired${when}: no reply arrived before the child's ask timeout.`;
+		case "deadline": return `${subject} ended around its ask deadline${when}: either no reply arrived before the child's ask timeout, or its run was stopped just before then.${runNow}`;
+		case "inactive": return `${subject} was closed because its child run ended${when}.${runNow}`;
+		case "missing": return `${subject} was withdrawn by the child before its ask deadline${when}. A child withdraws its request when its run is stopped, interrupted or times out, for example when a workflow aborts its other children after one fails.${runNow}`;
+	}
+}
+
+function resolvePendingRequest(pending: Map<string, PendingSupervisorRequest>, params: IntercomParams, ended: Map<string, EndedSupervisorRequest>, runState: (request: SupervisorRequest) => SubagentState): PendingSupervisorRequest {
+	const requests = [...pending.values()].filter((request) => request.expectsReply);
 	if (params.replyTo) {
 		const request = pending.get(params.replyTo);
-		if (!request) throw new Error(`No pending supervisor request found for replyTo '${params.replyTo}'.`);
+		if (!request) {
+			// A child stops waiting after its ask timeout and may ask again under a new id. Its first
+			// notice can reach a busy parent after that, so name what can still be answered.
+			const current = requests.length ? `Pending now:\n${requests.map(pendingHeader).join("\n")}` : "No pending supervisor requests.";
+			const endedRequest = ended.get(params.replyTo);
+			if (endedRequest) throw new Error(`${endedRequestText(endedRequest, runState(endedRequest.request))} ${current}`);
+			throw new Error(`No pending supervisor request found for replyTo '${params.replyTo}'. It was answered, expired or withdrawn. ${current}`);
+		}
 		return request;
 	}
-	const requests = [...pending.values()].filter((request) => request.expectsReply);
 	if (params.to) {
 		const normalizedTo = params.to.toLowerCase();
 		const matches = requests.filter((request) =>
@@ -585,7 +676,7 @@ function publicPendingRequests(pending: Map<string, PendingSupervisorRequest>): 
 	}));
 }
 
-function buildParentSupervisorTool(pi: ExtensionAPI, pending: Map<string, PendingSupervisorRequest>, state: SubagentState, onLifecycle: SupervisorRequestLifecycleObserver, discover: () => void, runState: (request: SupervisorRequest) => SubagentState): ToolDefinition<typeof IntercomParamsSchema, Record<string, unknown>> {
+function buildParentSupervisorTool(pi: ExtensionAPI, pending: Map<string, PendingSupervisorRequest>, state: SubagentState, onLifecycle: SupervisorRequestLifecycleObserver, discover: () => void, runState: (request: SupervisorRequest) => SubagentState, ended: Map<string, EndedSupervisorRequest>): ToolDefinition<typeof IntercomParamsSchema, Record<string, unknown>> {
 	return {
 		name: NATIVE_SUPERVISOR_TOOL_NAME,
 		...MODEL_ONLY_TOOL,
@@ -605,11 +696,11 @@ function buildParentSupervisorTool(pi: ExtensionAPI, pending: Map<string, Pendin
 				return { content: [{ type: "text", text: lines.length ? lines.join("\n") : "No pending supervisor requests." }], details: { pending: publicPendingRequests(pending) } };
 			}
 			if (input.action === "reply") {
-				const request = resolvePendingRequest(pending, input);
+				const request = resolvePendingRequest(pending, input, ended, runState);
 				const reply = writeReply(request, input.message ?? "");
 				appendSupervisorReplyEntry(pi, request, reply);
 				pending.delete(request.id);
-				onLifecycle(request, "resolved");
+				onLifecycle(request, "resolved", reply.createdAt);
 				clearForegroundSupervisorAttention(request, pending, state);
 				return { content: [{ type: "text", text: `Replied to supervisor request ${request.id}.` }], details: { replyTo: request.id, runId: request.runId, agent: request.agent } };
 			}
@@ -640,6 +731,10 @@ export function createNativeSupervisorChannel(pi: ExtensionAPI, state: SubagentS
 	// One continuation and one warning per request; never auto-answer or loop.
 	const settleNotices = new Map<string, "reminded" | "warned" | "handled">();
 	let unsubscribeSettle: (() => void) | undefined;
+	// Asks whose notice Pi queued behind a busy parent run. The child's wait counts from its request,
+	// so until the parent's model can see one, its expiresAt keeps moving forward.
+	const queuedNotices = new Set<string>();
+	let unsubscribeDelivery: Array<(() => void) | undefined> | undefined;
 	const requestCorrelations = new Map<string, SupervisorRequestCorrelation>();
 	const correlationKey = (request: { runId: string; agent: string; childIndex: number; toolCallId?: string }): string | undefined => {
 		if (!request.toolCallId) return undefined;
@@ -667,9 +762,31 @@ export function createNativeSupervisorChannel(pi: ExtensionAPI, state: SubagentS
 		requestCorrelations.set(key, { request, state: "resolved", updatedAt: Date.now() });
 		pruneRequestCorrelations();
 	};
-	const observeRequestLifecycle: SupervisorRequestLifecycleObserver = (request, lifecycle) => {
+	// How each request ended, so a late reply can say why it is gone instead of a generic miss.
+	const endedRequests = new Map<string, EndedSupervisorRequest>();
+	const rememberEndedRequest = (request: PendingSupervisorRequest, lifecycle: EndedSupervisorRequest["lifecycle"], eventAt: number | undefined): void => {
+		if (!request.expectsReply) return;
+		const now = Date.now();
+		endedRequests.delete(request.id);
+		endedRequests.set(request.id, { request, lifecycle, endedAt: now, ...(eventAt !== undefined ? { eventAt } : {}) });
+		for (const [id, ended] of endedRequests) {
+			if (now - ended.endedAt <= SUPERVISOR_REQUEST_CORRELATION_RETENTION_MS && endedRequests.size <= MAX_SUPERVISOR_REQUEST_CORRELATIONS) break;
+			endedRequests.delete(id);
+		}
+	};
+	const observeRequestLifecycle: SupervisorRequestLifecycleObserver = (request, lifecycle, eventAt) => {
 		settleNotices.delete(request.id);
+		if (queuedNotices.delete(request.id)) updateDeliverySubscription();
 		if (lifecycle !== "wrong-session") rememberResolvedRequest(request);
+		// A child that hits its ask deadline deletes its own request file, so a missing file past the deadline can be
+		// that timeout or a stop just before it. The parent extends a queued ask's expiresAt in memory too, so a live
+		// ask never reads as past it.
+		if (lifecycle !== "wrong-session" && lifecycle !== "pending") {
+			const now = Date.now();
+			const expiresAt = requestExpiresAt(request, now);
+			if (lifecycle === "missing" && now > expiresAt) rememberEndedRequest(request, "deadline", expiresAt);
+			else rememberEndedRequest(request, lifecycle, lifecycle === "expired" ? expiresAt : eventAt);
+		}
 		updateSettleSubscription();
 	};
 	const getSupervisorRequestState = (event: ControlEvent): SupervisorRequestState => {
@@ -716,7 +833,15 @@ export function createNativeSupervisorChannel(pi: ExtensionAPI, state: SubagentS
 	};
 
 	const registerParentTools = (): void => {
-		if (!hasTool(pi, NATIVE_SUPERVISOR_TOOL_NAME)) pi.registerTool(buildParentSupervisorTool(pi, pending, state, observeRequestLifecycle, () => poll(), runState));
+		if (!hasTool(pi, NATIVE_SUPERVISOR_TOOL_NAME)) pi.registerTool(buildParentSupervisorTool(pi, pending, state, observeRequestLifecycle, () => pollOnce(), runState, endedRequests));
+	};
+	// A session that never delegated through `subagent` does not declare the reply tool (scheduled runs, runs
+	// adopted after a resume), so declare it before the model is asked to use it.
+	const declareParentTool = (): void => {
+		if (typeof pi.getActiveTools !== "function" || typeof pi.setActiveTools !== "function") return;
+		const active = pi.getActiveTools();
+		if (!Array.isArray(active) || active.includes(NATIVE_SUPERVISOR_TOOL_NAME) || !hasTool(pi, NATIVE_SUPERVISOR_TOOL_NAME)) return;
+		pi.setActiveTools([...active, NATIVE_SUPERVISOR_TOOL_NAME]);
 	};
 
 	const cleanupStaleChannelsIfDue = (): void => {
@@ -731,10 +856,11 @@ export function createNativeSupervisorChannel(pi: ExtensionAPI, state: SubagentS
 		}
 	};
 
-	const poll = (): void => {
+	const pollOnce = (): void => {
 		cleanupStaleChannelsIfDue();
 		// Only display notifications require a live UI context, not request registration.
 		refreshPendingRequests(pending, state, observeRequestLifecycle, runState);
+		if (queuedNotices.size) extendQueuedNotices();
 		const now = Date.now();
 		const channels = deps.getChannelDirs?.();
 		for (const { channelDir, file } of listRequestFiles(channels?.dirs, platform)) {
@@ -748,6 +874,23 @@ export function createNativeSupervisorChannel(pi: ExtensionAPI, state: SubagentS
 				cleanupRequestLifecycle(request, lifecycle);
 				continue;
 			}
+			if (request.expectsReply && runState(request).blockingWorkflowChildren?.has(request.runId)) {
+				// Pi cannot deliver an ask behind the workflow tool call that awaits this child.
+				// Return a tool error instead of renewing an unreachable ask until the run deadline.
+				try {
+					writePrivateAtomicJson(replyPath(channelDir, request.id), {
+						type: "subagent.supervisor.reply", requestId: request.id, createdAt: now, message: "",
+						error: "Supervisor unavailable: the parent is blocked in an async:false workflow and cannot answer this request. Report the blocker and any partial results, then stop. Relaunch the workflow with async:true to allow supervisor replies.",
+					} satisfies SupervisorReply);
+				} catch (error) {
+					console.error(`Failed to report unreachable supervisor request ${request.id}; will retry:`, error);
+					continue;
+				}
+				seenFiles.add(file);
+				observeRequestLifecycle(request, "resolved", now);
+				cleanupRequestLifecycle(request, "resolved");
+				continue;
+			}
 			seenFiles.add(file);
 			if (!request.expectsReply) {
 				// Progress is already visible through child activity; do not inject a
@@ -757,12 +900,13 @@ export function createNativeSupervisorChannel(pi: ExtensionAPI, state: SubagentS
 			}
 			rememberPendingRequest(request);
 			pending.set(request.id, request);
+			declareParentTool();
 			updateSettleSubscription();
 			markForegroundSupervisorAttention(request, state);
 			// The ask is already queued above. A sendMessage failure (no UI, stale context) must not
 			// lose it, and must not abort the loop before the remaining asks register.
 			try {
-				(deps.parentWake ?? pi).sendMessage({
+				const appended = (deps.parentWake ?? pi).sendMessage({
 					customType: SUPERVISOR_REQUEST_MESSAGE_TYPE,
 					content: requestVisibleText(request),
 					display: true,
@@ -780,6 +924,11 @@ export function createNativeSupervisorChannel(pi: ExtensionAPI, state: SubagentS
 						replyHint: supervisorReplyHint(request.id),
 					},
 				}, { triggerTurn: true });
+				// false: Pi emits message_start for the notice (steered into a busy run, or starting an idle one); track it until then.
+				if (appended === false && started && pending.has(request.id)) {
+					queuedNotices.add(request.id);
+					updateDeliverySubscription();
+				}
 			} catch (error) {
 				console.error(`Failed to surface supervisor request ${request.id} as a user turn:`, error);
 			}
@@ -793,6 +942,17 @@ export function createNativeSupervisorChannel(pi: ExtensionAPI, state: SubagentS
 		}
 		channels?.retire?.();
 		updateSettleSubscription();
+	};
+
+	// Never throws: this runs from timers, watchers, setImmediate and event handlers, and Pi exits the process on an
+	// uncaught exception, so one unreadable temp directory must not end the session. Callers whose answer a model or a
+	// drain decision reads use pollOnce, so a failed scan is not mistaken for "no pending requests".
+	const poll = (): void => {
+		try {
+			pollOnce();
+		} catch (error) {
+			reportSessionWarning(state, `Supervisor channel poll failed: ${error instanceof Error ? error.message : String(error)}`, "supervisor-channel-poll");
+		}
 	};
 
 	const handleBeforeSettle = (event: AgentBeforeSettleEvent): AgentBeforeSettleEventResult | undefined => {
@@ -817,6 +977,7 @@ export function createNativeSupervisorChannel(pi: ExtensionAPI, state: SubagentS
 		});
 		updateSettleSubscription();
 		if (!requests.length) return;
+		declareParentTool();
 		const unanswered = requests.filter(request => !settleNotices.has(request.id));
 		if (unanswered.length) {
 			for (const request of unanswered)
@@ -855,6 +1016,45 @@ export function createNativeSupervisorChannel(pi: ExtensionAPI, state: SubagentS
 		if (!needed) {
 			unsubscribeSettle?.();
 			unsubscribeSettle = undefined;
+		}
+	};
+	const noticeDelivered = (event: MessageStartEvent): void => {
+		const message = event.message;
+		if (message.role !== "custom" || message.customType !== SUPERVISOR_REQUEST_MESSAGE_TYPE) return;
+		const requestId = (message.details as { requestId?: unknown } | undefined)?.requestId;
+		if (typeof requestId === "string" && queuedNotices.delete(requestId)) updateDeliverySubscription();
+	};
+	const parentRunSettled = (): void => {
+		// Pi delivers steered messages before a run settles; one still queued was dropped, so stop extending it.
+		queuedNotices.clear();
+		updateDeliverySubscription();
+	};
+	const updateDeliverySubscription = (): void => {
+		const needed = started && queuedNotices.size > 0;
+		if (needed && !unsubscribeDelivery) {
+			unsubscribeDelivery = [pi.on?.("message_start", noticeDelivered), pi.on?.("agent_settled", parentRunSettled)];
+		}
+		if (!needed) {
+			for (const unsubscribe of unsubscribeDelivery ?? []) unsubscribe?.();
+			unsubscribeDelivery = undefined;
+		}
+	};
+	const extendQueuedNotices = (): void => {
+		const now = Date.now();
+		const timeoutMs = askTimeoutMs();
+		for (const id of queuedNotices) {
+			const request = pending.get(id);
+			// Renew at half time only: the rewrite fires this channel's request watcher, which polls again.
+			if (!request || requestExpiresAt(request, now) - now > timeoutMs / 2 || !fs.existsSync(request.requestFile)) continue;
+			const { channelDir: _channelDir, requestFile, ...stored } = request;
+			try {
+				writePrivateAtomicJson(requestFile, { ...stored, expiresAt: now + timeoutMs });
+				request.expiresAt = now + timeoutMs;
+			} catch (error) {
+				queuedNotices.delete(id);
+				updateDeliverySubscription();
+				console.error(`Failed to extend supervisor request ${id} while its notice is queued; it keeps its current deadline:`, error);
+			}
 		}
 	};
 
@@ -942,7 +1142,7 @@ export function createNativeSupervisorChannel(pi: ExtensionAPI, state: SubagentS
 		},
 		hasPendingRequests: () => {
 			if (!started) return false;
-			poll();
+			pollOnce();
 			return pending.size > 0;
 		},
 		start: () => {
@@ -973,6 +1173,8 @@ export function createNativeSupervisorChannel(pi: ExtensionAPI, state: SubagentS
 		dispose: () => {
 			started = false;
 			updateSettleSubscription();
+			queuedNotices.clear();
+			updateDeliverySubscription();
 			try {
 				rootWatcher?.close();
 			} catch {
@@ -992,6 +1194,7 @@ export function createNativeSupervisorChannel(pi: ExtensionAPI, state: SubagentS
 			pending.clear();
 			settleNotices.clear();
 			requestCorrelations.clear();
+			endedRequests.clear();
 			seenFiles.clear();
 		},
 		pending,

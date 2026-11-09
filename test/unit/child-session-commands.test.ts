@@ -41,6 +41,7 @@ function fakePi(override?: ToolDefinition, commandOverride?: ToolDefinition) {
 			const ctx = { sessionManager: { getSessionId: () => "child", getSessionFile: () => undefined } } as ExtensionContext;
 			return { session: {
 				agent: { hasQueuedMessages: () => false },
+				getAllTools: () => [...tools.values()],
 				bindExtensions: async () => {},
 				dispose() {}, extensionRunner: { hasHandlers: () => false }, subscribe: () => () => {},
 				prompt: async (text) => { await tools.get("bash")!.execute("command", { command: text, ...(text.includes("sleep") ? { yieldTimeMs: 0 } : {}) }, undefined, undefined, ctx); },

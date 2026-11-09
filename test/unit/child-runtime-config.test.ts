@@ -75,7 +75,7 @@ describe("child runtime config", () => {
 		const pi = fakePi(["read"]);
 		for (const hook of createChildHooks(config)) hook.factory(pi.api as never);
 
-		assert.throws(() => pi.handlers.get("agent_start")?.[0]?.({}), /Agent 'config-agent' requested unavailable child tools: fixture_search/);
+		assert.doesNotThrow(() => pi.handlers.get("agent_start")?.[0]?.({}));
 		assert.deepEqual(diagnostics, [{ agent: "config-agent", required: ["read", "fixture_search"], available: ["read", "bg_wait", "structured_output"], missing: ["fixture_search"] }]);
 
 		const structured = pi.tools.find((tool) => tool.name === "structured_output") as { execute: (id: string, params: { value: unknown }) => Promise<unknown> } | undefined;

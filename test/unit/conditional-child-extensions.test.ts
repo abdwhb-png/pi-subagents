@@ -98,8 +98,8 @@ it("persists a conditional catalogue for workflow append without requiring exter
 	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-provider-retention-"));
 	try {
 		const catalogue = [{ id: "provider", path: "/tmp/provider.mjs", whenTools: ["inspect_symbols"] }];
-		writeRetainedRequiredChildExtensions(dir, catalogue);
-		assert.deepEqual(readRetainedRequiredChildExtensions(dir), catalogue);
+		writeRetainedRequiredChildExtensions(path.join(dir, "runs"), "fixture", catalogue);
+		assert.deepEqual(readRetainedRequiredChildExtensions(path.join(dir, "runs"), "fixture"), catalogue);
 		assertRequiredChildExtensionsAdmitted([catalogue], { agent: "worker", runnerType: "external-cli" });
 		assertRequiredChildExtensionsAdmitted([catalogue], { agent: "worker", machine: "remote" });
 	} finally { fs.rmSync(dir, { recursive: true, force: true }); }
@@ -108,10 +108,35 @@ it("persists a conditional catalogue for workflow append without requiring exter
 it("distinguishes a retained empty catalogue from a missing legacy snapshot", () => {
 	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-empty-provider-retention-"));
 	try {
-		assert.equal(readRetainedRequiredChildExtensions(dir), undefined);
-		writeRetainedRequiredChildExtensions(dir, []);
-		const retained = readRetainedRequiredChildExtensions(dir);
+		assert.equal(readRetainedRequiredChildExtensions(path.join(dir, "runs"), "fixture"), undefined);
+		writeRetainedRequiredChildExtensions(path.join(dir, "runs"), "fixture", []);
+		const retained = readRetainedRequiredChildExtensions(path.join(dir, "runs"), "fixture");
 		assert.deepEqual(retained, []);
 		assert.ok(Object.isFrozen(retained));
 	} finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+it("ignores a child-writable provider catalogue when appending retained work", () => {
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-protected-provider-"));
+	const runsRoot = path.join(root, "async-subagent-runs"), dir = path.join(runsRoot, "run");
+	fs.mkdirSync(dir, { recursive: true });
+	try {
+		writeRetainedRequiredChildExtensions(runsRoot, "run", []);
+		if (process.platform !== "win32") assert.equal(fs.statSync(path.join(root, "async-subagent-launches/run/required-child-extensions.json")).mode & 0o777, 0o600);
+		fs.writeFileSync(path.join(dir, "required-child-extensions.json"), JSON.stringify([{ id: "injected", path: "/tmp/untrusted.mjs" }]));
+		assert.deepEqual(readRetainedRequiredChildExtensions(runsRoot, "run"), []);
+	} finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+it("propagates access errors for an existing retained catalogue", { skip: process.platform === "win32" || process.getuid?.() === 0 }, () => {
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-unreadable-catalogue-"));
+	const runsRoot = path.join(root, "runs"), records = path.join(root, "async-subagent-launches", "run");
+	try {
+		writeRetainedRequiredChildExtensions(runsRoot, "run", []);
+		fs.chmodSync(records, 0);
+		assert.throws(() => readRetainedRequiredChildExtensions(runsRoot, "run"), { code: "EACCES" });
+	} finally {
+		if (fs.existsSync(records)) fs.chmodSync(records, 0o700);
+		fs.rmSync(root, { recursive: true, force: true });
+	}
 });

@@ -8,6 +8,7 @@ import { updateActiveRunIndex } from "../../src/runs/background/active-run-index
 import { summarizeAsyncStatus } from "../../src/runs/background/async-status.ts";
 import { formatAsyncResultTranscript, formatAsyncRunTranscript } from "../../src/runs/background/fleet-view.ts";
 import { inspectSubagentStatus } from "../../src/runs/background/run-status.ts";
+import { resolveExternalCliRunnerStatus } from "../../src/runs/shared/external-cli-contract.ts";
 import { createNestedRoute, writeNestedEvent } from "../../src/runs/shared/nested-events.ts";
 import { claimRunFanoutBatch, createRunFanoutBudget, writeRunFanoutBudgetDescriptor } from "../../src/runs/shared/run-fanout-budget.ts";
 import { TEMP_ROOT_DIR, type AsyncStatus, type SubagentState } from "../../src/shared/types.ts";
@@ -383,6 +384,21 @@ describe("async run status inspection", () => {
 			assert.equal(result.isError, undefined);
 			assert.match(text, /Adapter: external-cli v1 \(one-shot-stdin\)/);
 			assert.match(text, /Unsupported resume: The one-shot stdin adapter has no durable external session identity/);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("labels external-cli safety as the adapter profile, not a measurement", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-run-status-safety-"));
+		try {
+			const asyncRoot = path.join(root, "runs");
+			const runner = resolveExternalCliRunnerStatus({ adapter: "claude-code-writer", command: "claude" });
+			fs.mkdirSync(path.join(asyncRoot, "run-safety"), { recursive: true });
+			fs.writeFileSync(path.join(asyncRoot, "run-safety", "status.json"), JSON.stringify({ runId: "run-safety", mode: "single", state: "complete", startedAt: 100, lastUpdate: 200, steps: [{ agent: "writer", status: "complete", runner }] }), "utf-8");
+
+			const status = textContent(inspectSubagentStatus({ id: "run-safety" }, { asyncDirRoot: asyncRoot, resultsDir: path.join(root, "results") }));
+			assert.match(status, /\n  Safety \(adapter profile, not measured\): access=workspace-write, .*tools=Read,Write,Edit,Glob,Grep, mcp=empty-strict/);
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 		}
@@ -994,6 +1010,32 @@ describe("async run status inspection", () => {
 			assert.equal(result.isError, undefined);
 			assert.match(text, /run-current/);
 			assert.doesNotMatch(text, /run-other/);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("offers resume only to the session that launched the run", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-run-status-resume-owner-"));
+		try {
+			const asyncRoot = path.join(root, "runs");
+			const resultsDir = path.join(root, "results");
+			const sessionFile = path.join(root, "session.jsonl");
+			fs.mkdirSync(path.join(asyncRoot, "run-status"), { recursive: true });
+			fs.mkdirSync(resultsDir, { recursive: true });
+			fs.writeFileSync(sessionFile, "", "utf-8");
+			fs.writeFileSync(path.join(asyncRoot, "run-status", "status.json"), JSON.stringify({
+				runId: "run-status", sessionId: "session-owner", mode: "single", state: "complete", startedAt: 100, lastUpdate: 200, endedAt: 200, sessionFile,
+				steps: [{ agent: "worker", status: "complete", startedAt: 100, sessionFile }],
+			}), "utf-8");
+			fs.writeFileSync(path.join(resultsDir, "run-result.json"), JSON.stringify({ id: "run-result", sessionId: "session-owner", agent: "worker", success: true, state: "complete", sessionFile, results: [{ agent: "worker", success: true, sessionFile }] }), "utf-8");
+			for (const id of ["run-status", "run-result"]) {
+				const inspect = (currentSessionId: string) => textContent(inspectSubagentStatus({ id }, { asyncDirRoot: asyncRoot, resultsDir, state: { currentSessionId, asyncJobs: new Map(), foregroundControls: new Map() } as unknown as SubagentState }));
+				assert.match(inspect("session-owner"), new RegExp(`Revive: subagent\\(\\{ action: "resume", id: "${id}"`), id);
+				const successor = inspect("session-successor");
+				assert.doesNotMatch(successor, /Revive/, id);
+				assert.match(successor, /Resume: unavailable; only the session that launched this run can resume it\./, id);
+			}
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 		}
@@ -1827,7 +1869,7 @@ describe("async run status inspection", () => {
 				state: "stopped",
 				stopped: true,
 				sessionFile,
-				summary: "Subagent stopped by user.",
+				summary: "Subagent stopped.",
 			}, null, 2), "utf-8");
 
 			const result = inspectSubagentStatus({ id: "run-stopped-result" }, {

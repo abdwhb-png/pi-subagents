@@ -30,18 +30,28 @@ it("session startup yields to the event loop and both first advertisements await
 		fs.writeFileSync(path.join(newerPackage, "agents", "new-specialist.md"), agent("new-specialist"));
 		fs.writeFileSync(path.join(localDir, "local-specialist.md"), agent("local-specialist"));
 		const oldDone = path.join(temp, "old-lookup-finished");
+		const oldPid = path.join(temp, "old-lookup-pid");
+		const oldRelease = path.join(temp, "old-lookup-release");
 		fs.writeFileSync(path.join(bin, "fake-npm.cjs"), `
 const fs = require("node:fs");
 const phase = process.env.TEST_NPM_PHASE;
 if (phase === "failure") { console.error("private npm failure"); process.exit(1); }
-setTimeout(() => { if (phase === "old") fs.writeFileSync(${JSON.stringify(oldDone)}, "done"); if (phase !== "timeout") console.log(phase === "latest" ? ${JSON.stringify(newerRoot)} : ${JSON.stringify(globalRoot)}); }, phase === "timeout" ? 6000 : phase === "old" ? 2500 : phase === "seed" || phase === "latest" ? 150 : 300);
+const print = () => { if (phase !== "timeout") console.log(phase === "latest" ? ${JSON.stringify(newerRoot)} : ${JSON.stringify(globalRoot)}); };
+if (phase === "old") {
+	process.on("SIGTERM", () => process.exit(0));
+	process.on("exit", () => fs.writeFileSync(${JSON.stringify(oldDone)}, "done"));
+	fs.writeFileSync(${JSON.stringify(oldPid)}, String(process.pid));
+	// The stale lookup answers only after the test releases it; the cap only ends an orphan.
+	const cap = Date.now() + 30000;
+	const poll = setInterval(() => { if (fs.existsSync(${JSON.stringify(oldRelease)}) || Date.now() > cap) { clearInterval(poll); print(); } }, 25);
+} else setTimeout(print, phase === "timeout" ? 6000 : phase === "seed" || phase === "latest" ? 150 : 300);
 `);
 		const npm = path.join(bin, process.platform === "win32" ? "npm.cmd" : "npm");
 		fs.writeFileSync(npm, process.platform === "win32"
 			? `@echo off\r\n"${process.execPath}" "%~dp0fake-npm.cjs" %*\r\n`
 			: `#!/bin/sh\nexec "${process.execPath}" "$(dirname "$0")/fake-npm.cjs" "$@"\n`);
 		if (process.platform !== "win32") fs.chmodSync(npm, 0o755);
-		const env = { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH ?? ""}`, HOME: path.join(temp, "home"), USERPROFILE: path.join(temp, "home"), PI_CODING_AGENT_DIR: path.join(temp, "home"), TEST_PROJECT: path.join(fixtureRoot, "project"), TEST_OLD_DONE: oldDone, TEST_NPM_PHASE: "initial", APPDATA: path.join(temp, "missing-appdata") };
+		const env = { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH ?? ""}`, HOME: path.join(temp, "home"), USERPROFILE: path.join(temp, "home"), PI_CODING_AGENT_DIR: path.join(temp, "home"), TEST_PROJECT: path.join(fixtureRoot, "project"), TEST_OLD_DONE: oldDone, TEST_OLD_PID: oldPid, TEST_OLD_RELEASE: oldRelease, TEST_NPM_PHASE: "initial", APPDATA: path.join(temp, "missing-appdata") };
 		delete env.PI_OFFLINE;
 		delete env[SUBAGENT_CHILD_ENV];
 		const output = execFileSync(process.execPath, ["--experimental-strip-types", "--import", "./test/support/register-loader.mjs", "--input-type=module", "--eval", String.raw`
@@ -75,6 +85,11 @@ setTimeout(() => { if (phase === "old") fs.writeFileSync(${JSON.stringify(oldDon
 				await before(event, ctx);
 				return event.systemPromptOptions.sections.advertised_subagents;
 			};
+			const waitForFile = async (file, message, ms = 3000) => {
+				const deadline = Date.now() + ms;
+				while (!fs.existsSync(file) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
+				assert.equal(fs.existsSync(file), true, message);
+			};
 			start({ reason: "startup" }, ctx);
 			let tick = false;
 			setTimeout(() => { tick = true; }, 10);
@@ -102,8 +117,9 @@ setTimeout(() => { if (phase === "old") fs.writeFileSync(${JSON.stringify(oldDon
 			process.env.TEST_NPM_PHASE = "seed";
 			assert.ok(discoverAgents(ctx.cwd, "both").agents.some((agent) => agent.name === "global-specialist"));
 			process.env.TEST_NPM_PHASE = "old";
+			const oldStarted = Date.now();
 			start({ reason: "reload" }, ctx);
-			await new Promise((resolve) => setTimeout(resolve, 50));
+			await waitForFile(process.env.TEST_OLD_PID);
 			const waitingOnOld = advertise();
 			const waitingLoader = tools.get("subagents_enable").execute("reload", {}, new AbortController().signal, undefined, ctx);
 			const registration = registerRuntimeAgent({ pi, name: "runtime-test", definition: { description: "Test", systemPrompt: "Test" } });
@@ -112,7 +128,12 @@ setTimeout(() => { if (phase === "old") fs.writeFileSync(${JSON.stringify(oldDon
 			const mergedExecution = tools.get("subagent").execute("merged-runtime", { agent: "new-specialist", task: "Probe", async: false }, new AbortController().signal, undefined, ctx)
 				.then((result) => JSON.stringify(result), (error) => error.message);
 			const [latest, reloadedLoader] = await Promise.all([waitingOnOld, waitingLoader]);
-			assert.equal(fs.existsSync(process.env.TEST_OLD_DONE), false, "old lookup held the new session's prompt");
+			// The latest catalog must not wait for the obsolete lookup timeout.
+			assert.ok(Date.now() - oldStarted < 5000, "old lookup held the new session's prompt");
+			if (process.platform !== "win32") {
+				await waitForFile(process.env.TEST_OLD_DONE, "superseded owned lookup must exit without release");
+			}
+			fs.writeFileSync(process.env.TEST_OLD_RELEASE, "release");
 			assert.match(latest, /<name>new-specialist<\/name>/);
 			assert.match(reloadedLoader.content[0].text, /<name>new-specialist<\/name>/);
 			assert.doesNotMatch(latest, /<name>global-specialist<\/name>/);
@@ -129,8 +150,9 @@ setTimeout(() => { if (phase === "old") fs.writeFileSync(${JSON.stringify(oldDon
 				.then((result) => JSON.stringify(result), (error) => error.message);
 			assert.match(runtime, /new-specialist/, "execution must resolve the advertised agent");
 			assert.doesNotMatch(runtime, /Unknown agent|not found/i);
-			await new Promise((resolve) => setTimeout(resolve, 2600));
-			assert.equal(fs.existsSync(process.env.TEST_OLD_DONE), true, "old lookup completed");
+			// Windows shell descendants may need the release; POSIX owned children were cancelled above.
+			await waitForFile(process.env.TEST_OLD_DONE, "old lookup completed", 15_000);
+			await new Promise((resolve) => setTimeout(resolve, 500));
 			const afterStale = await advertise();
 			assert.match(afterStale, /<name>new-specialist<\/name>/);
 			assert.doesNotMatch(afterStale, /<name>global-specialist<\/name>/);
@@ -142,10 +164,45 @@ setTimeout(() => { if (phase === "old") fs.writeFileSync(${JSON.stringify(oldDon
 			fs.writeFileSync(path.join(process.env.PI_CODING_AGENT_DIR, "settings.json"), "{");
 			start({ reason: "reload" }, ctx);
 			await assert.rejects(tools.get("subagent").execute("invalid", { action: "list" }, new AbortController().signal, undefined, ctx), /Failed to parse settings file/);
+			fs.rmSync(path.join(process.env.PI_CODING_AGENT_DIR, "settings.json"));
+			fs.rmSync(process.env.TEST_OLD_DONE, {force: true});
+			fs.rmSync(process.env.TEST_OLD_PID, {force: true});
+			fs.rmSync(process.env.TEST_OLD_RELEASE, {force: true});
+			process.env.TEST_NPM_PHASE = "old";
+			start({ reason: "reload" }, ctx);
+			await waitForFile(process.env.TEST_OLD_PID);
+			const waitingAtShutdown = advertise();
+			await Promise.all(hooks.get("session_shutdown").map(handler => handler({reason: "exit"}, ctx)));
+			let shutdownWatchdog;
+			try {
+				const shutdownResult = await Promise.race([waitingAtShutdown, new Promise((_, reject) => { shutdownWatchdog = setTimeout(() => reject(new Error("shutdown barrier did not settle before releasing old lookup")), 1000); })]);
+				assert.equal(shutdownResult, undefined);
+			} finally {
+				clearTimeout(shutdownWatchdog);
+				fs.writeFileSync(process.env.TEST_OLD_RELEASE, "release");
+			}
+			await waitForFile(process.env.TEST_OLD_DONE);
+			await new Promise(resolve => setTimeout(resolve, 50));
+			assert.equal(await advertise(), undefined, "shutdown must not republish a late catalog");
+			// A prompt still waiting when a runtime with a finished catalog shuts down must not get that catalog.
+			const firstRuntimeShutdownHandlers = hooks.get("session_shutdown").length;
+			register(pi);
+			const restartedBefore = hooks.get("before_agent_start").at(-2);
+			const advertiseRestarted = async () => {
+				const event = { systemPrompt: "base", systemPromptOptions: { selectedTools: ["subagent"], sections: {} } };
+				await restartedBefore(event, ctx);
+				return event.systemPromptOptions.sections.advertised_subagents;
+			};
+			process.env.TEST_NPM_PHASE = "latest";
+			hooks.get("session_start").at(-2)({ reason: "startup" }, ctx);
+			assert.match(await advertiseRestarted(), /<name>new-specialist<\/name>/);
+			const promptDuringShutdown = advertiseRestarted();
+			await Promise.all(hooks.get("session_shutdown").slice(firstRuntimeShutdownHandlers).map(handler => handler({reason: "exit"}, ctx)));
+			assert.equal(await promptDuringShutdown, undefined, "shutdown must not hand out the retired catalog");
 			console.log("responsive session_start; complete first prompt and loader");
 		`], { cwd: repo, env, encoding: "utf8", timeout: 30_000 });
 		assert.match(output, /responsive session_start; complete first prompt and loader/);
 	} finally {
-		fs.rmSync(temp, { recursive: true, force: true });
+		fs.rmSync(temp, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 	}
 });

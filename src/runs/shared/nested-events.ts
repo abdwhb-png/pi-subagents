@@ -361,6 +361,7 @@ export function sanitizeSummary(input: unknown, depth = 0): NestedRunSummary | u
 		...(clampNumber(raw.pid) !== undefined && clampNumber(raw.pid)! > 0 && Number.isInteger(clampNumber(raw.pid)) ? { pid: clampNumber(raw.pid) } : {}),
 		...(stringValue(raw.sessionId, 256) ? { sessionId: stringValue(raw.sessionId, 256) } : {}),
 		...(stringValue(raw.sessionFile, 2048) ? { sessionFile: stringValue(raw.sessionFile, 2048) } : {}),
+		...(isSafeNestedId(raw.revivedFrom) ? { revivedFrom: raw.revivedFrom } : {}),
 		...(stringValue(raw.intercomTarget, 256) ? { intercomTarget: stringValue(raw.intercomTarget, 256) } : {}),
 		...(stringValue(raw.ownerIntercomTarget, 256) ? { ownerIntercomTarget: stringValue(raw.ownerIntercomTarget, 256) } : {}),
 		...(stringValue(raw.leafIntercomTarget, 256) ? { leafIntercomTarget: stringValue(raw.leafIntercomTarget, 256) } : {}),
@@ -635,7 +636,7 @@ export interface NestedRunResolutionScope {
 	descendantOf?: { parentRunId: string; parentStepIndex?: number };
 }
 
-function collectNestedRuns(children: NestedRunSummary[] | undefined, output: NestedRunSummary[] = []): NestedRunSummary[] {
+export function collectNestedRuns(children: NestedRunSummary[] | undefined, output: NestedRunSummary[] = []): NestedRunSummary[] {
 	for (const child of children ?? []) {
 		output.push(child);
 		collectNestedRuns(child.children, output);
@@ -1014,6 +1015,7 @@ export function nestedSummaryFromAsyncStatus(status: AsyncStatus, asyncDir: stri
 		asyncDir,
 		...(status.pid ? { pid: status.pid } : {}),
 		...(status.sessionId ? { sessionId: status.sessionId } : {}),
+		...(status.revivedFrom ? { revivedFrom: status.revivedFrom } : {}),
 		mode: status.mode ?? fallback.mode,
 		...(status.steps?.length === 1 && status.steps[0]?.model ? { model: status.steps[0].model } : {}),
 		...(status.steps?.length === 1 && status.steps[0]?.thinking ? { thinking: status.steps[0].thinking } : {}),

@@ -203,7 +203,7 @@ describe("agent management config parsing", () => {
 		assert.ok(reviewer, "reviewer builtin should be present in capability output");
 		assert.deepEqual(reviewer.tools.names, ["read", "grep", "find", "ls", "watchdog_diff", "contact_supervisor"]);
 		assert.match(readText(listed), /Tools: read, grep, find, ls, watchdog_diff, contact_supervisor/);
-		assert.equal("acceptance" in reviewer, false);
+		assert.deepEqual(reviewer.acceptance, { role: "read-only" });
 	});
 
 	it("reports bare and disabled acceptance declarations in capabilities", () => {
@@ -225,6 +225,28 @@ describe("agent management config parsing", () => {
 		assert.ok(rows);
 		assert.deepEqual(rows.find((agent) => agent.name === "accepted-worker")?.acceptance, { policy: "checked" });
 		assert.deepEqual(rows.find((agent) => agent.name === "open-worker")?.acceptance, { policy: false });
+	});
+
+	it("marks a model pin the active registry cannot resolve in capabilities and models", () => {
+		const agentsDir = path.join(tempDir, ".pi", "agents");
+		fs.mkdirSync(agentsDir, { recursive: true });
+		fs.writeFileSync(path.join(agentsDir, "gone-pin.md"), "---\nname: gone-pin\ndescription: Gone pin\nmodel: openai/gone-model\n---\n\nGone.\n");
+		fs.writeFileSync(path.join(agentsDir, "live-pin.md"), "---\nname: live-pin\ndescription: Live pin\nmodel: openai/gpt-5-mini:high\n---\n\nLive.\n");
+		const ctx = { cwd: tempDir, modelRegistry: { getAvailable: () => [{ provider: "openai", id: "gpt-5-mini" }] } };
+
+		const listed = handleManagementAction("list", { agentScope: "project", capabilities: true }, ctx);
+		const text = readText(listed);
+		assert.match(text, /- gone-pin \(project\): .*; Model: openai\/gone-model \(unavailable in the active model registry\);/);
+		assert.match(text, /- live-pin \(project\): .*; Model: openai\/gpt-5-mini:high;/);
+		const rows = listed.details?.agentCapabilities?.agents;
+		assert.deepEqual(rows?.find((agent) => agent.name === "gone-pin")?.model, { value: "openai/gone-model", unavailable: true });
+		assert.deepEqual(rows?.find((agent) => agent.name === "live-pin")?.model, { value: "openai/gpt-5-mini:high" });
+
+		const models = readText(handleManagementAction("models", { agent: "gone-pin", agentScope: "project" }, ctx));
+		assert.match(models, /Effective model:\n  openai\/gone-model \(unavailable in the active model registry\)\n/);
+
+		const emptyRegistry = handleManagementAction("list", { agentScope: "project", capabilities: true }, { cwd: tempDir, modelRegistry: { getAvailable: () => [] } });
+		assert.doesNotMatch(readText(emptyRegistry), /unavailable in the active model registry/);
 	});
 
 	it("reports optional review gates as optional in capabilities", () => {
@@ -995,6 +1017,33 @@ Advise only.
 		);
 		assert.equal(chainResult.isError, true);
 		assert.match(readText(chainResult), /Durable chain definitions were removed/);
+	});
+
+	it("rejects an unknown thinking level without writing the agent file", () => {
+		const ctx = { cwd: tempDir, modelRegistry: { getAvailable: () => [] } };
+		const filePath = path.join(tempDir, ".pi", "agents", "thinker.md");
+		const created = handleCreate({ config: { name: "thinker", description: "Think", scope: "project", thinking: "hgih" } }, ctx);
+		assert.equal(created.isError, true);
+		assert.match(readText(created), /config\.thinking must be one of off, minimal, low, medium, high, xhigh, max, or false/);
+		assert.equal(fs.existsSync(filePath), false);
+
+		assert.equal(handleCreate({ config: { name: "thinker", description: "Think", scope: "project", thinking: "high" } }, ctx).isError, false);
+		const before = fs.readFileSync(filePath, "utf-8");
+		assert.match(before, /^thinking: high$/m);
+		assert.equal(handleUpdate({ agent: "thinker", config: { thinking: "hgih" } }, ctx).isError, true);
+		assert.equal(fs.readFileSync(filePath, "utf-8"), before);
+	});
+
+	it("saves an explicit thinking: off on create and on a padded update", () => {
+		const ctx = { cwd: tempDir, modelRegistry: { getAvailable: () => [] } };
+		const agentsDir = path.join(tempDir, ".pi", "agents");
+		assert.equal(handleCreate({ config: { name: "quiet", description: "Quiet", scope: "project", thinking: "off" } }, ctx).isError, false);
+		assert.match(fs.readFileSync(path.join(agentsDir, "quiet.md"), "utf-8"), /^thinking: off$/m);
+		assert.match(readText(handleManagementAction("get", { agent: "quiet" }, ctx)), /Thinking: off/);
+
+		assert.equal(handleCreate({ config: { name: "loud", description: "Loud", scope: "project", thinking: "high" } }, ctx).isError, false);
+		assert.equal(handleUpdate({ agent: "loud", config: { thinking: " off " } }, ctx).isError, false);
+		assert.match(fs.readFileSync(path.join(agentsDir, "loud.md"), "utf-8"), /^thinking: off$/m);
 	});
 
 	it("creates, updates, reports, clears, and validates acceptance roles", () => {

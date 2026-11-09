@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { JsonSchemaObject } from "../../src/shared/types.ts";
-import { validateStructuredOutputValue } from "../../src/runs/shared/structured-output.ts";
+import { prepareStructuredOutputArguments, validateStructuredOutputValue } from "../../src/runs/shared/structured-output.ts";
 
 async function invalidMessage(schema: JsonSchemaObject, value: unknown): Promise<string> {
 	const result = await validateStructuredOutputValue(schema, value);
@@ -196,4 +196,37 @@ test("keeps selected-branch diagnostics deterministic and bounded to eight", asy
 	}, Object.fromEntries(Array.from({ length: 20 }, (_, index) => [`later${index}`, true])));
 
 	assert.equal(message, required.slice(0, 8).map((field) => `${field}: is required`).join("; "));
+});
+
+test("names the permitted values for an invalid enum or const field", async () => {
+	const message = await invalidMessage({
+		type: "object",
+		properties: {
+			outcome: { enum: ["applied", "blocked"] },
+			level: { enum: Array.from({ length: 25 }, (_, index) => index) },
+			kind: { const: "report" },
+		},
+	}, { outcome: "fixed", level: 99, kind: "note" });
+
+	assert.equal(message, [
+		`outcome: must be one of "applied", "blocked"`,
+		`level: must be one of ${Array.from({ length: 20 }, (_, index) => index).join(", ")}, and 5 more`,
+		`kind: must be "report"`,
+	].join("; "));
+});
+
+test("rejects a cyclic $ref schema with a readable error instead of a stack overflow", async () => {
+	const cyclic: JsonSchemaObject = {
+		$defs: { node: { anyOf: [{ $ref: "#/$defs/node" }, { type: "string" }] } },
+		type: "object",
+		required: ["v"],
+		properties: { v: { $ref: "#/$defs/node" } },
+	};
+
+	assert.match(await invalidMessage(cyclic, { v: "x" }), /^outputSchema cannot be validated \(cyclic or too deep\): /);
+	assert.match(await invalidMessage({ allOf: [{ $ref: "#" }] }, "raw"), /^outputSchema cannot be validated \(cyclic or too deep\): /);
+	assert.throws(
+		() => prepareStructuredOutputArguments(cyclic, { value: { v: "x" } }),
+		/^Error: Structured output validation failed: outputSchema cannot be validated \(cyclic or too deep\): /,
+	);
 });

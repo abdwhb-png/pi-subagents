@@ -1,15 +1,7 @@
-/**
- * Integration tests for async (background) agent execution.
- *
- * Tests the async support utilities: jiti availability check,
- * status file reading/caching.
- *
- * Requires pi packages to be importable. Skips gracefully if unavailable.
- */
-
 import { describe, it } from "node:test";
+import { recoveryDescriptorPath } from "../../src/runs/shared/run-launch-folder.ts";
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { once } from "node:events";
 import { createServer, type Socket } from "node:net";
 import * as fs from "node:fs";
@@ -584,8 +576,8 @@ setTimeout(() => process.exit(90), 15000).unref();
 				structuredOutputCapture: { ok: true },
 				jsonl: [
 					{ type: "tool_execution_start", toolName: "structured_output", args: { value: { ok: true } } },
-					{ type: "tool_result_end", message: { role: "toolResult", toolName: "structured_output", content: [{ type: "text", text: "Structured output captured." }] } },
 					{ type: "tool_execution_end", toolName: "structured_output" },
+					{ type: "message_end", message: { role: "toolResult", toolName: "structured_output", content: [{ type: "text", text: "Structured output captured." }] } },
 					terminalMessage,
 				],
 			});
@@ -621,8 +613,8 @@ setTimeout(() => process.exit(90), 15000).unref();
 			mockPi.onCall(capture === "invalid" ? {
 				jsonl: [
 					{ type: "tool_execution_start", toolName: "structured_output", args: { value: { ok: "invalid" } } },
-					{ type: "tool_result_end", message: { role: "toolResult", toolName: "structured_output", content: [{ type: "text", text: "Structured output validation failed." }], isError: true } },
 					{ type: "tool_execution_end", toolName: "structured_output", isError: true },
+					{ type: "message_end", message: { role: "toolResult", toolName: "structured_output", content: [{ type: "text", text: "Structured output validation failed." }], isError: true } },
 					events.assistantMessage("done"),
 				],
 			} : { output: "done" });
@@ -1213,8 +1205,10 @@ setTimeout(() => process.exit(90), 15000).unref();
 		const result = await readAsyncPayload(id);
 		assert.equal(result.success, true);
 		const rows = fs.readFileSync(path.join(ASYNC_DIR, id, "events.jsonl"), "utf8").trim().split("\n").map((line) => JSON.parse(line));
-		const attention = rows.filter((row) => row.type === "subagent.control" && row.event?.reason === "tool_open_threshold").map((row) => row.event.toolCallId);
-		assert.deepEqual(attention, ["bash-first", "bash-second"]);
+		const attention = rows.filter((row) => row.type === "subagent.control" && row.event?.reason === "tool_open_threshold");
+		assert.deepEqual(attention.map((row) => row.event.toolCallId), ["bash-first", "bash-second"]);
+		// The mock child has no native command controller, so the notice must not offer command controls.
+		for (const row of attention) assert.doesNotMatch(row.noticeText, /"action":"command\.(status|yield|cancel)"/);
 	});
 
 	it("background runs emit active-long-running control events from child turns", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
@@ -1626,6 +1620,113 @@ setTimeout(() => process.exit(90), 15000).unref();
 		}
 	});
 
+	it("background runs record a parallel batch's mutating failure against the failed call's path", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		// Pi's parallel tool execution: every start and end comes before the result messages.
+		const result = (toolCallId: string, isError: boolean, text: string) => ({ type: "message_end", message: { role: "toolResult", toolCallId, toolName: "edit", isError, content: [{ type: "text", text }] } });
+		mockPi.onCall({
+			steps: [
+				{ jsonl: [
+					{ type: "tool_execution_start", toolCallId: "edit-a", toolName: "edit", args: { path: "src/a.ts" } },
+					{ type: "tool_execution_start", toolCallId: "edit-b", toolName: "edit", args: { path: "src/b.ts" } },
+					{ type: "tool_execution_end", toolCallId: "edit-a", toolName: "edit", isError: true },
+					{ type: "tool_execution_end", toolCallId: "edit-b", toolName: "edit", isError: false },
+					result("edit-a", true, "No exact match found for a.ts"),
+					result("edit-b", false, "Edited src/b.ts"),
+				] },
+				{ jsonl: [events.assistantMessage("Edit A failed.")] },
+			],
+		});
+
+		const id = `async-parallel-failure-${Date.now().toString(36)}`;
+		const eventsPath = path.join(ASYNC_DIR, id, "events.jsonl");
+		const resultPath = path.join(RESULTS_DIR, `${id}.json`);
+		executeAsyncSingle(id, {
+			agent: "worker",
+			task: "Edit both files",
+			agentConfig: makeAgent("worker"),
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+			artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+			shareEnabled: false,
+			sessionRoot: path.join(tempDir, "sessions"),
+			maxSubagentDepth: 2,
+			controlConfig: {
+				enabled: true,
+				needsAttentionAfterMs: 999_999,
+				activeNoticeAfterTurns: 999_999,
+				activeNoticeAfterMs: 999_999,
+				activeNoticeAfterTokens: 999_999,
+				failedToolAttemptsBeforeAttention: 1,
+				notifyOn: ["active_long_running", "needs_attention"],
+				notifyChannels: ["event", "async", "intercom"],
+			},
+		});
+
+		const deadline = Date.now() + 10_000;
+		while (!fs.existsSync(resultPath)) {
+			if (Date.now() > deadline) assert.fail(`Timed out waiting for async result file: ${resultPath}`);
+			await new Promise((resolve) => setTimeout(resolve, 100));
+		}
+		const failureEvent = fs.readFileSync(eventsPath, "utf-8").split("\n").filter(Boolean)
+			.map((line) => (JSON.parse(line) as { event?: { reason?: string; currentPath?: string; recentFailureSummary?: string } }).event)
+			.find((event) => event?.reason === "tool_failures");
+		assert.equal(failureEvent?.currentPath, "src/a.ts");
+		assert.equal(failureEvent?.recentFailureSummary, "edit(src/a.ts): No exact match found for a.ts");
+	});
+
+	it("background status shows a tool-budget block from Pi's tool result message while the run is active", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		const blockedMessage = "Tool budget hard limit reached after 2 tool calls (hard 1). The 'bash' tool is blocked so you can finalize from the context you already have.";
+		const blockedResult = { role: "toolResult", toolCallId: "bash-2", toolName: "bash", isError: true, content: [{ type: "text", text: blockedMessage }] };
+		mockPi.onCall({
+			steps: [
+				{ jsonl: [events.toolStart("bash", { command: "echo 1" }), events.toolEnd("bash"), events.toolResult("bash", "1")] },
+				// Pi's sequence for a call blocked by a tool_call handler: start, end with isError, then the toolResult message.
+				{ jsonl: [
+					{ type: "tool_execution_start", toolCallId: "bash-2", toolName: "bash", args: { command: "echo 2" } },
+					{ type: "tool_execution_end", toolCallId: "bash-2", toolName: "bash", isError: true },
+					{ type: "message_start", message: blockedResult },
+					{ type: "message_end", message: blockedResult },
+				] },
+				{ delay: 2_000, jsonl: [events.assistantMessage("Finalizing from what I have.")] },
+			],
+		});
+
+		const id = `async-tool-budget-blocked-${Date.now().toString(36)}`;
+		const statusPath = path.join(ASYNC_DIR, id, "status.json");
+		const resultPath = path.join(RESULTS_DIR, `${id}.json`);
+		executeAsyncSingle(id, {
+			agent: "worker",
+			task: "Run echo three times",
+			agentConfig: makeAgent("worker"),
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+			artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+			shareEnabled: false,
+			sessionRoot: path.join(tempDir, "sessions"),
+			maxSubagentDepth: 2,
+			toolBudget: { hard: 1, block: "*" },
+		});
+
+		const deadline = Date.now() + 10_000;
+		let blockedStep: AsyncStatusPayload["steps"][number] | undefined;
+		while (Date.now() < deadline && !fs.existsSync(resultPath)) {
+			if (fs.existsSync(statusPath)) {
+				const step = (JSON.parse(fs.readFileSync(statusPath, "utf-8")) as AsyncStatusPayload).steps?.[0];
+				if (step?.status === "running" && step.toolBudgetBlocked) {
+					blockedStep = step;
+					break;
+				}
+			}
+			await new Promise((resolve) => setTimeout(resolve, 50));
+		}
+		assert.ok(blockedStep, "expected status.json to show the tool-budget block while the run is still active");
+		assert.equal(blockedStep.toolBudget?.blockedTool, "bash");
+
+		const doneDeadline = Date.now() + 10_000;
+		while (!fs.existsSync(resultPath)) {
+			if (Date.now() > doneDeadline) assert.fail(`Timed out waiting for async result file: ${resultPath}`);
+			await new Promise((resolve) => setTimeout(resolve, 100));
+		}
+	});
+
 	it("background event logs drop noisy message updates and cap child diagnostics", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
 		const previousMaxBytes = process.env.PI_SUBAGENT_ASYNC_EVENTS_MAX_BYTES;
 		process.env.PI_SUBAGENT_ASYNC_EVENTS_MAX_BYTES = "1100";
@@ -1787,6 +1888,8 @@ setTimeout(() => process.exit(90), 15000).unref();
 			const asyncDir = path.join(ASYNC_DIR, id);
 			const asking = await waitForAsyncState(id, (status) => status.currentTool === "contact_supervisor");
 			assert.deepEqual((asking as AsyncStatusPayload & { launcher?: unknown }).launcher, { name: "wrap", argv: runnerLaunchers.wrap });
+			// A launcher may run the runner under another kernel, so its pid never carries Pi's boot id.
+			assert.equal((asking as AsyncStatusPayload & { bootId?: unknown }).bootId, undefined);
 			const wrapperArgv = fs.readFileSync(argvLog, "utf-8").trimEnd().split("\n");
 			assert.equal(wrapperArgv[0], "tag arg");
 			assert.ok(path.isAbsolute(wrapperArgv[1]!), "the wrapper received the resolved runner executable");
@@ -1968,6 +2071,43 @@ runner.on("exit", (code, signal) => process.exit(signal ? 128 + require("node:os
 		assert.equal(mockPi.callCount(), 0);
 	});
 
+	it("signals a pre-proceed runner only when the pid it reports is inside the launcher's process tree", { timeout: 30_000, skip: !isAsyncAvailable() || process.platform === "win32" ? "requires jiti and POSIX signals" : undefined }, async () => {
+		// The launcher reports `pid` (or its own child for "own"), then blocks the proceed write so startup fails after adoption.
+		const forger = path.join(tempDir, "forger.cjs");
+		fs.writeFileSync(forger, `const fs = require("node:fs"), path = require("node:path");
+const cfg = JSON.parse(fs.readFileSync(process.argv.at(-1), "utf-8"));
+const own = process.argv[2] === "own" ? require("node:child_process").spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" }) : undefined;
+let scope; try { scope = fs.readlinkSync("/proc/self/ns/pid"); } catch {}
+fs.mkdirSync(path.join(cfg.asyncDir, "runner-startup-proceed.json"));
+fs.writeFileSync(process.argv[3], JSON.stringify({ wrapperPid: process.pid, ownPid: own?.pid }));
+fs.writeFileSync(path.join(cfg.asyncDir, "runner-startup.json"), JSON.stringify({ state: "identified", token: cfg.launchBarrierToken, pid: own ? own.pid : Number(process.argv[2]), pidNamespaceScope: scope }));
+setInterval(() => {}, 1000);
+`);
+		const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+		const launch = async (target: string) => {
+			const pidsPath = path.join(tempDir, `forger-${target}.json`);
+			const executor = makeAsyncExecutor([makeAgent("sandboxed", { launcher: "forger" })], { runnerLaunchers: { forger: [process.execPath, forger, target, pidsPath] } });
+			const result = await executor.executePublic(`forger-${target}`, { agent: "sandboxed", task: "Work" }, new AbortController().signal, undefined, makeMinimalCtx(tempDir));
+			assert.match(result.content[0]?.text ?? "", /Failed to authorize async runner startup/);
+			return JSON.parse(fs.readFileSync(pidsPath, "utf-8")) as { wrapperPid: number; ownPid?: number };
+		};
+		const decoy = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+		const pids: number[] = [decoy.pid!];
+		try {
+			const forged = await launch(String(decoy.pid));
+			pids.push(forged.wrapperPid);
+			// The decoy is this process's child, so a signalled decoy is only reaped once the event loop runs.
+			await new Promise((resolve) => setTimeout(resolve, 200));
+			assert.equal(decoy.signalCode, null, "a pid outside the launcher's tree is never signalled");
+			const own = await launch("own");
+			pids.push(own.wrapperPid, own.ownPid!);
+			assert.equal(alive(own.ownPid!), false, "the launcher's own descendant is terminated");
+		} finally {
+			for (const pid of pids) try { process.kill(pid, "SIGKILL"); } catch {}
+		}
+		assert.equal(mockPi.callCount(), 0);
+	});
+
 	// Resume revives a retained session, so the source run is a fork with a pre-created session file.
 	const forkCtx = (name: string) => {
 		const parentSessionFile = path.join(tempDir, `${name}-parent.jsonl`);
@@ -1990,7 +2130,7 @@ runner.on("exit", (code, signal) => process.exit(signal ? 128 + require("node:os
 		const ctx = forkCtx("launcher-resume");
 		mockPi.onCall({ output: "first run" });
 		const sourceId = await launchAndFinish(executor, ctx, "sandboxed");
-		assert.equal(readJson(path.join(ASYNC_DIR, sourceId, "recovery-descriptor.json")).launcher, "wrap");
+		assert.equal(readJson(recoveryDescriptorPath(ASYNC_DIR, sourceId)).launcher, "wrap");
 		fs.rmSync(argvLog);
 		// The agent file no longer names a launcher; the recorded one still applies.
 		const unwrappedAgent = [makeAgent("sandboxed")];
@@ -1998,7 +2138,7 @@ runner.on("exit", (code, signal) => process.exit(signal ? 128 + require("node:os
 		const runsBefore = fs.readdirSync(ASYNC_DIR).length;
 		const refused = await resume(makeAsyncExecutor(unwrappedAgent, {}), ctx, sourceId);
 		assert.equal(refused.isError, true);
-		assert.match(refused.content[0]?.text ?? "", /launched with launcher 'wrap', which is no longer defined in runnerLaunchers/);
+		assert.match(refused.content[0]?.text ?? "", /uses launcher 'wrap', which is no longer defined in runnerLaunchers/);
 		assert.equal(mockPi.callCount(), 1);
 		assert.equal(getActiveAsyncCapacitySnapshot("launcher-resume-session", 4).used, capacityBefore);
 		assert.equal(fs.readdirSync(ASYNC_DIR).length, runsBefore, "the refused resume created no run");
@@ -2024,6 +2164,34 @@ runner.on("exit", (code, signal) => process.exit(signal ? 128 + require("node:os
 		assert.equal((await readAsyncPayload(resumed.details.asyncId!)).success, true);
 		assert.equal(fs.existsSync(argvLog), false);
 		assert.equal((readJson(path.join(ASYNC_DIR, resumed.details.asyncId!, "status.json")) as { launcher?: unknown }).launcher, undefined);
+	});
+
+	it("revives a launcher workflow child through its workflow run under the agent's launcher", { timeout: 30_000, skip: !isAsyncAvailable() || process.platform === "win32" ? "requires jiti and a POSIX wrapper" : undefined }, async () => {
+		const { argvLog, runnerLaunchers } = launcherExecutor();
+		const authority = { version: 1 as const, allowedAgents: ["sandboxed"], denyExtensions: false, sources: ["workflow-parent"] };
+		const executor = createSubagentExecutor!({
+			pi: { events: createEventBus(), getSessionName: () => undefined, sendMessage() {} },
+			state: { baseCwd: tempDir, currentSessionId: "session-123", asyncJobs: new Map(), foregroundControls: new Map(), lastForegroundControlId: null },
+			config: { runnerLaunchers },
+			asyncByDefault: false,
+			tempArtifactsDir: tempDir,
+			getSubagentSessionRoot: () => tempDir,
+			expandTilde: (value: string) => value,
+			discoverAgents: () => ({ agents: [makeAgent("sandboxed", { launcher: "wrap" })] }),
+			childRuntime: { capabilityCeiling: authority },
+		});
+		const ctx = makeMinimalCtx(tempDir);
+		mockPi.onCall({ output: "first run" });
+		const launch = await executor.execute("launcher-workflow", { workflowScript: `return await runs.run("child", { agent: "sandboxed", task: "Work", acceptance: false })`, async: true, mission: false, capabilityCeiling: authority }, new AbortController().signal, undefined, ctx);
+		assert.equal(launch.isError, undefined, launch.content[0]?.text);
+		await readAsyncPayload(launch.details!.asyncId!);
+		assert.equal(fs.existsSync(argvLog), true, "the workflow child ran wrapped");
+		fs.rmSync(argvLog);
+		mockPi.onCall({ output: "resumed run" });
+		const resumed = await executor.execute("launcher-workflow-resume", { action: "resume", id: launch.details?.asyncId, message: "Continue", acceptance: false }, new AbortController().signal, undefined, ctx);
+		assert.equal(resumed.isError, undefined, resumed.content[0]?.text);
+		assert.equal((await readAsyncPayload(resumed.details!.asyncId!)).success, true);
+		assert.equal(fs.existsSync(argvLog), true, "the revived child runs under the agent's launcher");
 	});
 
 	const runChain = (id: string, chain: unknown[], agents: ReturnType<typeof makeAgent>[], runnerLaunchers: Record<string, string[]>) => executeAsyncChain(id, {

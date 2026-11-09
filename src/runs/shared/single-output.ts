@@ -1,7 +1,8 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { Message } from "@earendil-works/pi-ai";
-import type { OutputMode, SavedOutputReference } from "../../shared/types.ts";
+import type { OutputMode, PlacementMachineReference, SavedOutputReference } from "../../shared/types.ts";
+import { isRexLocalMachine } from "./rex-machine.ts";
 
 const READ_ONLY_OUTPUT_TOOLS = new Set([
 	"read", "grep", "find", "ls", "web_search", "fetch_content", "get_search_content",
@@ -101,21 +102,6 @@ interface OutputInstructionCapabilities {
 	mcpDirectTools?: string[];
 }
 
-function formatOutputPathInstruction(outputPath: string, capabilities?: OutputInstructionCapabilities): string {
-	const delivery = !capabilities || hasOutputWriteCapability(capabilities.tools, capabilities.mcpDirectTools)
-		? `Write your findings to exactly this path: ${outputPath}`
-		: [
-			"Return the complete artifact in your final response.",
-			`The runtime will persist it to exactly this path: ${outputPath}`,
-			"Do not call contact_supervisor merely because no write-capable tool is available.",
-		].join("\n");
-	return [
-		delivery,
-		"This path is authoritative for this run.",
-		"Ignore any other output filename or output path mentioned elsewhere, including output destinations in the base agent prompt, system prompt, or task instructions.",
-	].join("\n");
-}
-
 export function requestedOutputPathFromTask(task: string): string | undefined {
 	for (const line of task.split(/\r?\n/).reverse()) {
 		const match = line.match(/^\s*(?:Write your findings to(?: exactly this path)?:|The runtime will persist it to exactly this path:)\s*(.+?)\s*$/i);
@@ -133,15 +119,23 @@ export function outputPathMappingFromTask(task: string, savedPath: string | unde
 	return { requestedPath, savedPath };
 }
 
-export function injectSingleOutputInstruction(task: string, outputPath: string | undefined, capabilities?: OutputInstructionCapabilities): string {
+/** A child on another machine cannot write the parent-side path; its final reply is saved there instead. */
+export function injectSingleOutputInstruction(task: string, outputPath: string | undefined, capabilities?: OutputInstructionCapabilities, machine?: PlacementMachineReference): string {
 	if (!outputPath) return task;
-	return `${task}\n\n---\n**Output:**\n${formatOutputPathInstruction(outputPath, capabilities)}`;
-}
-
-export function injectOutputPathSystemPrompt(systemPrompt: string, outputPath: string | undefined, capabilities?: OutputInstructionCapabilities): string {
-	if (!outputPath) return systemPrompt;
-	const instruction = `Runtime output path override:\n${formatOutputPathInstruction(outputPath, capabilities)}`;
-	return systemPrompt ? `${systemPrompt}\n\n${instruction}` : instruction;
+	const remote = machine !== undefined && !isRexLocalMachine(machine);
+	const delivery = !remote && (!capabilities || hasOutputWriteCapability(capabilities.tools, capabilities.mcpDirectTools))
+		? `Write your findings to exactly this path: ${outputPath}`
+		: [
+			"Return the complete artifact in your final response.",
+			`The runtime will persist it to exactly this path: ${outputPath}`,
+			"Do not call contact_supervisor merely because no write-capable tool is available.",
+		].join("\n");
+	return [
+		`${task}\n\n---\n**Output:**`,
+		delivery,
+		"This path is authoritative for this run.",
+		"Ignore any other output filename or output path mentioned elsewhere, including output destinations in the system prompt or the task instructions.",
+	].join("\n");
 }
 
 function countLines(text: string): number {
@@ -179,6 +173,8 @@ const INLINE_OUTPUT_HEAD_CHARS = 2_000;
 const MAX_FULL_OUTPUT_FILE_BYTES = 50 * 1024 * 1024;
 /** The line finalizeSingleOutput appends when inline output was also saved to an explicit output file. */
 const SAVED_OUTPUT_LINE = /\n\nOutput saved to: (.+) \([^()\n]*\)\. Read this file if needed\.$/;
+/** How many trailing `\n\n` blocks a file-backed head may be followed by, such as a timed-out child's recovery summary. */
+const MAX_UNFILED_TRAILING_BLOCKS = 8;
 
 function readFullOutputFile(filePath: string): string | undefined {
 	try {
@@ -190,10 +186,24 @@ function readFullOutputFile(filePath: string): string | undefined {
 	}
 }
 
+/** The longest prefix of output, ending before at most `maxTrailingBlocks` of its last `\n\n` blocks, that the file holds and that is worth capping. */
+function fileBackedHead(output: string, fullOutput: string, maxTrailingBlocks: number): string | undefined {
+	if (fullOutput.includes(output)) return output;
+	let end = output.length;
+	for (let attempt = 0; attempt < maxTrailingBlocks; attempt++) {
+		end = output.lastIndexOf("\n\n", end - 1);
+		if (end <= INLINE_OUTPUT_HEAD_CHARS) return undefined;
+		const head = output.slice(0, end);
+		if (fullOutput.includes(head)) return head;
+	}
+	return undefined;
+}
+
 /**
  * Keeps at most INLINE_OUTPUT_HEAD_CHARS of a child's output inline and points to the file holding all of it.
  * Files come only from run records, never from the child's text: a trailing `Output saved to:` line is kept as the
  * pointer only when it names the run's recorded saved-output path, and that recorded path is what gets read.
+ * Trailing blocks the file does not hold, such as a timed-out child's recovery summary, stay inline after the pointer.
  * Output stays whole when it is short or no readable file contains it, so no text is lost.
  */
 export function capInlineOutput(output: string, files: { artifactPath?: string; savedPath?: string }): string {
@@ -203,13 +213,15 @@ export function capInlineOutput(output: string, files: { artifactPath?: string; 
 	const filePath = savedLine ? files.savedPath : files.artifactPath;
 	if (body.length <= INLINE_OUTPUT_HEAD_CHARS || !filePath) return output;
 	const fullOutput = readFullOutputFile(filePath);
-	if (fullOutput === undefined || !fullOutput.includes(body)) return output;
-	const lineEnd = body.lastIndexOf("\n", INLINE_OUTPUT_HEAD_CHARS);
+	if (fullOutput === undefined) return output;
+	const head = fileBackedHead(body, fullOutput, savedLine ? 0 : MAX_UNFILED_TRAILING_BLOCKS);
+	if (head === undefined) return output;
+	const lineEnd = head.lastIndexOf("\n", INLINE_OUTPUT_HEAD_CHARS);
 	let end = lineEnd >= INLINE_OUTPUT_HEAD_CHARS - 200 ? lineEnd : INLINE_OUTPUT_HEAD_CHARS;
-	if (/[\uD800-\uDBFF]/.test(body[end - 1] ?? "")) end -= 1;
-	if (savedLine) return `${body.slice(0, end)}\n…${output.slice(body.length)}`;
+	if (/[\uD800-\uDBFF]/.test(head[end - 1] ?? "")) end -= 1;
+	if (savedLine) return `${head.slice(0, end)}\n…${output.slice(body.length)}`;
 	const reference = formatSavedOutputReference(filePath, fullOutput);
-	return `${body.slice(0, end)}\n…\nFull output: ${reference.path} (${formatByteSize(reference.bytes)}, ${reference.lines} ${reference.lines === 1 ? "line" : "lines"}). Read it if needed.`;
+	return `${head.slice(0, end)}\n…\nFull output: ${reference.path} (${formatByteSize(reference.bytes)}, ${reference.lines} ${reference.lines === 1 ? "line" : "lines"}). Read it if needed.${body.slice(head.length)}`;
 }
 
 /** Applies capInlineOutput to each `agent:\noutput` section of a run summary whose child output is long. */
@@ -363,4 +375,16 @@ export function finalizeSingleOutput(params: {
 		return { displayOutput, saveError: params.saveError };
 	}
 	return { displayOutput };
+}
+
+/**
+ * Returns true for fatal claim-path mismatches in any mode, or when required file-only output
+ * fails to persist without a savedPath. Inline and optional outputs remain nonfatal warnings.
+ */
+export function isSettlementFatalOutputError(
+	resolvedOutput: { savedPath?: string; saveError?: string; fatalError?: boolean },
+	outputMode?: OutputMode,
+): boolean {
+	return resolvedOutput.fatalError === true
+		|| (outputMode === "file-only" && !resolvedOutput.savedPath && Boolean(resolvedOutput.saveError));
 }

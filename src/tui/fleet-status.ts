@@ -8,6 +8,7 @@ import { contextModeLabel } from "../runs/shared/context-mode.ts";
 import { formatWorkflowJsonPreview } from "../workflows/scripted-workflow.ts";
 import { hostStepReportName, hostStepVerdictLabel } from "../runs/shared/host-step-status.ts";
 import { isStaleExtensionContextError } from "../shared/extension-context.ts";
+import { reportSessionWarning } from "../shared/session-warnings.ts";
 import { inlineWorkflowRenderKey } from "./render.ts";
 import { runningTone } from "./running-tone.ts";
 import { childThinkingLevel, type ThinkingLevel } from "../shared/model-info.ts";
@@ -514,7 +515,7 @@ export function collectFleetStatusEntries(state: SubagentState): FleetStatusEntr
 
 	if (state.currentSessionId) {
 		try {
-			for (const run of snapshotExternalRuns(state.currentSessionId, { ignoreMalformed: true, onMalformedRecord: (message) => console.warn(`[pi-subagents] Removed ${message}`) })) {
+			for (const run of snapshotExternalRuns(state.currentSessionId, { ignoreMalformed: true, onMalformedRecord: (message) => reportSessionWarning(state, `Removed ${message}`) })) {
 				if (!isActiveState(run.state)) continue;
 				entries.push({
 					key: `external:${run.id}`,
@@ -527,7 +528,7 @@ export function collectFleetStatusEntries(state: SubagentState): FleetStatusEntr
 				});
 			}
 		} catch (cause) {
-			console.warn(`[pi-subagents] Failed to inspect external jobs: ${cause instanceof Error ? cause.message : String(cause)}`);
+			reportSessionWarning(state, `Failed to inspect external jobs: ${cause instanceof Error ? cause.message : String(cause)}`);
 		}
 	}
 

@@ -25,6 +25,8 @@ import {
 	removeTempDir,
 	tryImport,
 } from "../support/helpers.ts";
+import { recoveryDescriptorPath } from "../../src/runs/shared/run-launch-folder.ts";
+import { writeFileCreatingDir } from "../support/helpers.ts";
 
 interface ExecutorResult {
 	content: Array<{ text?: string }>;
@@ -189,10 +191,11 @@ describe("intercom result delivery cutover", { skip: !available ? "executor not 
 	function writeRecoveryDescriptor(asyncDir: string, runId: string, agent = "worker", overrides: Record<string, unknown> = {}): void {
 		const runFanoutBudget = createRunFanoutBudget(runId, 64);
 		budgetDirectories.push(runFanoutBudget.directory);
-		fs.writeFileSync(path.join(asyncDir, "recovery-descriptor.json"), JSON.stringify({
+		writeFileCreatingDir(recoveryDescriptorPath(path.dirname(asyncDir), path.basename(asyncDir)), JSON.stringify({
 			version: 1,
 			runFanoutBudget,
 			sourceRunId: runId,
+			sessionId: "session-123",
 			agent,
 			cwd: tempDir,
 			systemPromptMode: "replace",
@@ -338,7 +341,7 @@ describe("intercom result delivery cutover", { skip: !available ? "executor not 
 				sessionFile,
 				steps: [{ agent: "worker", status: "complete", sessionFile }],
 			}, null, 2), "utf-8");
-			writeRecoveryDescriptor(sourceAsyncDir, sourceRunId);
+			writeRecoveryDescriptor(sourceAsyncDir, sourceRunId, "worker", { sessionFile });
 			const { executor } = makeExecutor();
 
 			const result = await executor.execute(
@@ -456,8 +459,8 @@ describe("intercom result delivery cutover", { skip: !available ? "executor not 
 		mockPi.onCall({
 			stdoutRaw: [
 				{ type: "tool_execution_start", toolName: "structured_output", args: { value: { ok: true } } },
-				{ type: "tool_result_end", message: { role: "toolResult", toolName: "structured_output", content: [{ type: "text", text: "Structured output captured." }] } },
 				{ type: "tool_execution_end", toolName: "structured_output" },
+				{ type: "message_end", message: { role: "toolResult", toolName: "structured_output", content: [{ type: "text", text: "Structured output captured." }] } },
 			].map((entry) => JSON.stringify(entry)).join("\n") + "\n",
 			structuredOutputCapture: { ok: true },
 		});
@@ -869,8 +872,8 @@ describe("intercom result delivery cutover", { skip: !available ? "executor not 
 					} else {
 						const structuredEvents = [
 							{ type: "tool_execution_start", toolName: "structured_output", args: { value: { ok: true } } },
-							{ type: "tool_result_end", message: { role: "toolResult", toolName: "structured_output", content: [{ type: "text", text: "Structured output captured." }] } },
 							{ type: "tool_execution_end", toolName: "structured_output" },
+							{ type: "message_end", message: { role: "toolResult", toolName: "structured_output", content: [{ type: "text", text: "Structured output captured." }] } },
 						];
 						mockPi.onCall({
 							stdoutRaw: structuredEvents.map((entry) => JSON.stringify(entry)).join("\n") + "\n",
@@ -1089,7 +1092,7 @@ describe("intercom result delivery cutover", { skip: !available ? "executor not 
 					{ agent: "b", status: "complete", sessionFile: secondSession, model: "anthropic/claude-sonnet-4", thinking: "high" },
 				],
 			}, null, 2), "utf-8");
-			writeRecoveryDescriptor(asyncDir, runId, "b", { model: "anthropic/claude-sonnet-4:high" });
+			writeRecoveryDescriptor(asyncDir, runId, "b", { model: "anthropic/claude-sonnet-4:high", sessionFile: secondSession });
 			const { executor } = makeExecutor({ agents: [makeAgent("a"), makeAgent("b")] });
 
 			const result = await executor.execute(
@@ -1141,7 +1144,7 @@ describe("intercom result delivery cutover", { skip: !available ? "executor not 
 				sessionFile,
 				steps: [{ agent: "worker", status: "complete", launchContractDigest: "source-launch-contract-digest" }],
 			}, null, 2), "utf-8");
-			writeRecoveryDescriptor(asyncDir, runId, "worker", { launchContractDigest: "source-launch-contract-digest" });
+			writeRecoveryDescriptor(asyncDir, runId, "worker", { launchContractDigest: "source-launch-contract-digest", sessionFile });
 			const { executor, events } = makeExecutor();
 
 			const result = await executor.execute(
@@ -1200,7 +1203,7 @@ describe("intercom result delivery cutover", { skip: !available ? "executor not 
 				parentWorkflowRunId: workflowRunId, workflowKey: "memory", sessionFile,
 				steps: [{ agent: "worker", status: "failed", sessionFile, error: "429 rate limit" }],
 			}), "utf-8");
-			writeRecoveryDescriptor(childDir, childRunId);
+			writeRecoveryDescriptor(childDir, childRunId, "worker", { sessionFile });
 			const { executor } = makeExecutor();
 
 			const revived = await executor.execute("revive-workflow-child", { action: "resume", id: childRunId, message: "Retry after the rate limit." }, new AbortController().signal, undefined, makeMinimalCtx(tempDir));
@@ -1307,6 +1310,7 @@ describe("intercom result delivery cutover", { skip: !available ? "executor not 
 				steps: [{ agent: "removed-worker", status: "paused", sessionFile }],
 			}, null, 2), "utf-8");
 			writeRecoveryDescriptor(asyncDir, runId, "removed-worker", {
+				sessionFile,
 				model: "anthropic/claude-sonnet-4:high",
 				tools: ["read"],
 				systemPrompt: "Original persisted prompt",
@@ -1358,7 +1362,7 @@ describe("intercom result delivery cutover", { skip: !available ? "executor not 
 			sessionFile,
 			steps: [{ agent: "worker", status: "complete" }],
 		}, null, 2), "utf-8");
-		writeRecoveryDescriptor(sourceAsyncDir, sourceRunId);
+		writeRecoveryDescriptor(sourceAsyncDir, sourceRunId, "worker", { sessionFile });
 		try {
 			const { executor } = makeExecutor();
 			const first = await executor.execute(
@@ -1424,7 +1428,7 @@ describe("intercom result delivery cutover", { skip: !available ? "executor not 
 				sessionFile,
 				steps: [{ agent: "worker", status: "complete", sessionFile }],
 			}, null, 2), "utf-8");
-			writeRecoveryDescriptor(sourceAsyncDir, sourceRunId);
+			writeRecoveryDescriptor(sourceAsyncDir, sourceRunId, "worker", { sessionFile, sessionId: parentSessionId });
 			const competingLease = acquireSessionLease({ sessionFile, runId: "workflow-competing-revival", sourceRunId, parentSessionId });
 			const { executor } = makeExecutor({ maxActiveAsyncRunsPerSession: 1 });
 			const ctx = makeMinimalCtx(tempDir);
@@ -1522,7 +1526,7 @@ describe("intercom result delivery cutover", { skip: !available ? "executor not 
 			sessionFile,
 			steps: [{ agent: "worker", status: "complete", sessionFile }],
 		}, null, 2), "utf-8");
-		writeRecoveryDescriptor(sourceAsyncDir, sourceRunId);
+		writeRecoveryDescriptor(sourceAsyncDir, sourceRunId, "worker", { sessionFile, sessionId: parentSessionId });
 		const sourceCapacity = acquireActiveAsyncCapacity({ sessionId: parentSessionId, limit: 1, runId: sourceRunId, kind: "runner", asyncDir: sourceAsyncDir });
 		assert.ok(sourceCapacity);
 		sourceCapacity.markStarted("source-runner");

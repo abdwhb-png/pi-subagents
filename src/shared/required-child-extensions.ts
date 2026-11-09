@@ -1,5 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { runLaunchDir } from "../runs/shared/run-launch-folder.ts";
+import { writePrivateAtomicJson } from "./atomic-json.ts";
 
 const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const MAX_REQUIRED_EXTENSIONS = 32;
@@ -121,12 +123,18 @@ export function assertRequiredChildExtensionsAdmitted(snapshots: ReadonlyArray<R
 const RETAINED_FILE = "required-child-extensions.json";
 
 /** An empty admission catalogue is authoritative too; only missing legacy files allow recapture. */
-export function writeRetainedRequiredChildExtensions(asyncDir: string, snapshot: RequiredChildExtensionSnapshot): void {
-	fs.writeFileSync(path.join(asyncDir, RETAINED_FILE), `${JSON.stringify(snapshot)}\n`, { mode: 0o600 });
+export function writeRetainedRequiredChildExtensions(runsRoot: string, runId: string, snapshot: RequiredChildExtensionSnapshot): void {
+	writePrivateAtomicJson(path.join(runLaunchDir(runsRoot, runId), RETAINED_FILE), snapshot);
 }
 
-export function readRetainedRequiredChildExtensions(asyncDir: string): RequiredChildExtensionSnapshot | undefined {
-	const filePath = path.join(asyncDir, RETAINED_FILE);
-	if (!fs.existsSync(filePath)) return undefined;
-	return snapshotRequiredChildExtensions(JSON.parse(fs.readFileSync(filePath, "utf-8")), "Retained required child extensions");
+export function readRetainedRequiredChildExtensions(runsRoot: string, runId: string): RequiredChildExtensionSnapshot | undefined {
+	const filePath = path.join(runLaunchDir(runsRoot, runId), RETAINED_FILE);
+	let text: string;
+	try {
+		text = fs.readFileSync(filePath, "utf-8");
+	} catch (error) {
+		if (error instanceof Error && "code" in error && error.code === "ENOENT") return undefined;
+		throw error;
+	}
+	return snapshotRequiredChildExtensions(JSON.parse(text), "Retained required child extensions");
 }
